@@ -11,7 +11,6 @@ import { useCurrency } from './Currency.provider';
 interface IContext {
   cart: IProductCart;
   addItem(item: CartItem): void;
-  updateItemQuantity(productId: string, newQuantity: number): void;
   emptyCart(): void;
   placeOrder(order: PlaceOrderRequest): Promise<OrderResult>;
 }
@@ -19,7 +18,6 @@ interface IContext {
 export const Context = createContext<IContext>({
   cart: { userId: '', items: [] },
   addItem: () => {},
-  updateItemQuantity: () => {},
   emptyCart: () => {},
   placeOrder: () => Promise.resolve({} as OrderResult),
 });
@@ -62,27 +60,56 @@ const CartProvider = ({ children }: IProps) => {
   });
 
   const addItem = useCallback(
-    (item: CartItem) => addCartMutation.mutateAsync({ ...item, currencyCode: selectedCurrency }),
-    [addCartMutation, selectedCurrency]
-  );
+    async (item: CartItem) => {
+      // Create AddToCart workflow span for Splunk RUM
+      let span: any = null;
+      if (typeof window !== 'undefined' && (window as any).tracer) {
+        span = (window as any).tracer.startSpan('AddToCart', {
+          attributes: {
+            'workflow.name': 'AddToCart',
+            'product.id': item.productId,
+            'product.quantity': item.quantity,
+          },
+        });
+      }
 
-  const updateItemQuantity = useCallback(
-    (productId: string, newQuantity: number) => {
-      const existing = cart.items.find(i => i.productId === productId);
-      const delta = newQuantity - (existing?.quantity ?? 0);
-      if (delta !== 0) {
-        addCartMutation.mutateAsync({ productId, quantity: delta, currencyCode: selectedCurrency });
+      try {
+        const result = await addCartMutation.mutateAsync({ ...item, currencyCode: selectedCurrency });
+        return result;
+      } finally {
+        if (span) {
+          span.end();
+        }
       }
     },
-    [addCartMutation, cart.items, selectedCurrency]
+    [addCartMutation, selectedCurrency]
   );
   const emptyCart = useCallback(() => emptyCartMutation.mutateAsync(), [emptyCartMutation]);
   const placeOrder = useCallback(
-    (order: PlaceOrderRequest) => placeOrderMutation.mutateAsync({ ...order, currencyCode: selectedCurrency }),
+    async (order: PlaceOrderRequest) => {
+      // Create PlaceOrder workflow span for Splunk RUM
+      let span: any = null;
+      if (typeof window !== 'undefined' && (window as any).tracer) {
+        span = (window as any).tracer.startSpan('PlaceOrder', {
+          attributes: {
+            'workflow.name': 'PlaceOrder',
+          },
+        });
+      }
+
+      try {
+        const result = await placeOrderMutation.mutateAsync({ ...order, currencyCode: selectedCurrency });
+        return result;
+      } finally {
+        if (span) {
+          span.end();
+        }
+      }
+    },
     [placeOrderMutation, selectedCurrency]
   );
 
-  const value = useMemo(() => ({ cart, addItem, updateItemQuantity, emptyCart, placeOrder }), [cart, addItem, updateItemQuantity, emptyCart, placeOrder]);
+  const value = useMemo(() => ({ cart, addItem, emptyCart, placeOrder }), [cart, addItem, emptyCart, placeOrder]);
 
   return <Context.Provider value={value}>{children}</Context.Provider>;
 };

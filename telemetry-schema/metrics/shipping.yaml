@@ -3,12 +3,11 @@
 
 file_format: definition/2
 metrics:
-  - name: demo.shipping.items_shipped
+  - name: app.shipping.items_count
     brief: Shipping items counter
     instrument: counter
     unit: "{item}"
     stability: stable
-    requirement_level: recommended
     note: Counts the number of items being shipped
     annotations:
       service: shipping

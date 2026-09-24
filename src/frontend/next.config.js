@@ -18,6 +18,7 @@ const {
   CHECKOUT_ADDR = '',
   CURRENCY_ADDR = '',
   PRODUCT_CATALOG_ADDR = '',
+  PRODUCT_REVIEWS_ADDR = '',
   RECOMMENDATION_ADDR = '',
   SHIPPING_ADDR = '',
   ENV_PLATFORM = '',
@@ -29,10 +30,10 @@ const {
 const nextConfig = {
   reactStrictMode: true,
   output: 'standalone',
+  productionBrowserSourceMaps: true, // Generate sourcemaps for production
   compiler: {
     styledComponents: true,
   },
-  serverExternalPackages: ['pino'],
   // Turbopack configuration (Next.js 16 default bundler)
   // Turbopack automatically handles Node.js polyfills for client bundles
   turbopack: {
@@ -40,13 +41,18 @@ const nextConfig = {
     root: __dirname,
   },
   // Keep webpack config for backwards compatibility if --webpack flag is used
-  webpack: (config, { isServer }) => {
+  webpack: (config, { isServer, dev }) => {
     if (!isServer) {
       config.resolve.fallback.http2 = false;
       config.resolve.fallback.tls = false;
       config.resolve.fallback.net = false;
       config.resolve.fallback.dns = false;
       config.resolve.fallback.fs = false;
+    }
+
+    // Enable source maps for all modules including React in production
+    if (!dev && !isServer) {
+      config.devtool = 'source-map';
     }
 
     return config;
@@ -57,6 +63,7 @@ const nextConfig = {
     CHECKOUT_ADDR,
     CURRENCY_ADDR,
     PRODUCT_CATALOG_ADDR,
+    PRODUCT_REVIEWS_ADDR,
     RECOMMENDATION_ADDR,
     SHIPPING_ADDR,
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,

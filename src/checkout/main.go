@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -19,7 +21,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/log/global"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
@@ -32,14 +33,13 @@ import (
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	otelcodes "go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 
 	sdklog "go.opentelemetry.io/otel/sdk/log"
@@ -52,10 +52,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	flags "github.com/open-telemetry/opentelemetry-demo/src/checkout/flags"
 	pb "github.com/open-telemetry/opentelemetry-demo/src/checkout/genproto/oteldemo"
 	"github.com/open-telemetry/opentelemetry-demo/src/checkout/kafka"
 	"github.com/open-telemetry/opentelemetry-demo/src/checkout/money"
@@ -64,17 +64,11 @@ import (
 //go:generate go install google.golang.org/protobuf/cmd/protoc-gen-go
 //go:generate go install google.golang.org/grpc/cmd/protoc-gen-go-grpc
 //go:generate protoc --go_out=./ --go-grpc_out=./ --proto_path=../../pb ../../pb/demo.proto
-//go:generate go install github.com/open-feature/cli/cmd/openfeature@v0.4.0
-//go:generate openfeature generate -o flags --package-name flags go
 
-var (
-	logger            *slog.Logger
-	tracer            trace.Tracer
-	resource          *sdkresource.Resource
-	initResourcesOnce sync.Once
-)
-
-const emailRequestTimeout = time.Second
+var logger *slog.Logger
+var tracer trace.Tracer
+var resource *sdkresource.Resource
+var initResourcesOnce sync.Once
 
 func initResource() *sdkresource.Resource {
 	initResourcesOnce.Do(func() {
@@ -96,9 +90,9 @@ func initResource() *sdkresource.Resource {
 func initTracerProvider() *sdktrace.TracerProvider {
 	ctx := context.Background()
 
-	exporter, err := otlptracehttp.New(ctx)
+	exporter, err := otlptracegrpc.New(ctx)
 	if err != nil {
-		logger.Error(fmt.Sprintf("new otlp trace http exporter failed: %v", err))
+		logger.Error(fmt.Sprintf("new otlp trace grpc exporter failed: %v", err))
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
@@ -112,9 +106,9 @@ func initTracerProvider() *sdktrace.TracerProvider {
 func initMeterProvider() *sdkmetric.MeterProvider {
 	ctx := context.Background()
 
-	exporter, err := otlpmetrichttp.New(ctx)
+	exporter, err := otlpmetricgrpc.New(ctx)
 	if err != nil {
-		logger.Error(fmt.Sprintf("new otlp metric http exporter failed: %v", err))
+		logger.Error(fmt.Sprintf("new otlp metric grpc exporter failed: %v", err))
 	}
 
 	mp := sdkmetric.NewMeterProvider(
@@ -128,7 +122,7 @@ func initMeterProvider() *sdkmetric.MeterProvider {
 func initLoggerProvider() *sdklog.LoggerProvider {
 	ctx := context.Background()
 
-	logExporter, err := otlploghttp.New(ctx)
+	logExporter, err := otlploggrpc.New(ctx)
 	if err != nil {
 		return nil
 	}
@@ -196,52 +190,57 @@ func main() {
 		logger.Error((err.Error()))
 	}
 
-	provider, err := flagd.NewProvider()
+	// WithoutCache: evaluate every flag against flagd live. The default RPC
+	// provider caches per-flag and only invalidates on configuration_change
+	// events; runtime flag changes (e.g. via flagd-ui) were not being picked
+	// up, so checkout kept routing to payment-vB after paymentFailure was set
+	// to off. Disabling the cache makes routing honor the current flag value.
+	provider, err := flagd.NewProvider(flagd.WithoutCache())
 	if err != nil {
-		logger.Error("Error creating flagd provider", slog.Any("error", err))
+		logger.Error(fmt.Sprintf("Error creating flagd provider: %v", err))
 	}
 
-	err = openfeature.SetProvider(provider)
-	if err != nil {
-		logger.Error("Failed to set flagd as the provider", slog.Any("error", err))
-	}
-	defer openfeature.Shutdown()
+	openfeature.SetProvider(provider)
 	openfeature.AddHooks(otelhooks.NewTracesHook())
 
 	tracer = tp.Tracer("checkout")
 
 	svc := new(checkout)
 	svc.httpClient = &http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Transport: otelhttp.NewTransport(http.DefaultTransport,
+			otelhttp.WithSpanOptions(trace.WithAttributes(
+				attribute.String("peer.service", "shipping"),
+			)),
+		),
 	}
 
 	mustMapEnv(&svc.shippingSvcAddr, "SHIPPING_ADDR")
-	c := mustCreateClient(svc.shippingSvcAddr)
+	c := mustCreateClient(svc.shippingSvcAddr, "shipping")
 	svc.shippingSvcClient = pb.NewShippingServiceClient(c)
 	defer c.Close()
 
 	mustMapEnv(&svc.productCatalogSvcAddr, "PRODUCT_CATALOG_ADDR")
-	c = mustCreateClient(svc.productCatalogSvcAddr)
+	c = mustCreateClient(svc.productCatalogSvcAddr, "product-catalog")
 	svc.productCatalogSvcClient = pb.NewProductCatalogServiceClient(c)
 	defer c.Close()
 
 	mustMapEnv(&svc.cartSvcAddr, "CART_ADDR")
-	c = mustCreateClient(svc.cartSvcAddr)
+	c = mustCreateClient(svc.cartSvcAddr, "cart")
 	svc.cartSvcClient = pb.NewCartServiceClient(c)
 	defer c.Close()
 
 	mustMapEnv(&svc.currencySvcAddr, "CURRENCY_ADDR")
-	c = mustCreateClient(svc.currencySvcAddr)
+	c = mustCreateClient(svc.currencySvcAddr, "currency")
 	svc.currencySvcClient = pb.NewCurrencyServiceClient(c)
 	defer c.Close()
 
 	mustMapEnv(&svc.emailSvcAddr, "EMAIL_ADDR")
-	c = mustCreateClient(svc.emailSvcAddr)
+	c = mustCreateClient(svc.emailSvcAddr, "email")
 	svc.emailSvcClient = pb.NewEmailServiceClient(c)
 	defer c.Close()
 
 	mustMapEnv(&svc.paymentSvcAddr, "PAYMENT_ADDR")
-	c = mustCreateClient(svc.paymentSvcAddr)
+	c = mustCreateClient(svc.paymentSvcAddr, "payment")
 	svc.paymentSvcClient = pb.NewPaymentServiceClient(c)
 	defer c.Close()
 
@@ -261,23 +260,23 @@ func main() {
 		logger.Error(err.Error())
 	}
 
-	srv := grpc.NewServer(
-		grpc.StatsHandler(otelgrpc.NewServerHandler(
-			otelgrpc.WithFilter(filters.Not(filters.HealthCheck())),
-		)),
+	var srv = grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 	pb.RegisterCheckoutServiceServer(srv, svc)
 
 	healthcheck := health.NewServer()
 	healthpb.RegisterHealthServer(srv, healthcheck)
 	logger.Info(fmt.Sprintf("starting to listen on tcp: %q", lis.Addr().String()))
+	err = srv.Serve(lis)
+	logger.Error(err.Error())
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 	defer cancel()
 
 	go func() {
 		if err := srv.Serve(lis); err != nil {
-			logger.Error("Failed to serve gRPC server", slog.Any("error", err))
+			logger.Error(err.Error())
 		}
 	}()
 
@@ -303,25 +302,55 @@ func (cs *checkout) Watch(req *healthpb.HealthCheckRequest, ws healthpb.Health_W
 	return status.Errorf(codes.Unimplemented, "health check via Watch not implemented")
 }
 
+// Promo codes applied at checkout. SPRING10 is the live customer campaign.
+// PROMOTEST100 is an internal test code that was never removed from the
+// pricing rules; when it matches, the order total is discounted to zero.
+// NONE means the promo engine is disabled and the customer pays full price.
+const (
+	noPromoCode       = "NONE"
+	livePromoCode     = "SPRING10"
+	livePromoDiscount = 10 // percent
+	testPromoCode     = "PROMOTEST100"
+	testPromoDiscount = 100 // percent
+
+	// promoRedemptionRate is the fraction of orders that redeem any promo code
+	// while the promo engine is enabled. Most shoppers don't use one, so the
+	// majority of orders stay at full price regardless of the flag setting.
+	promoRedemptionRate = 0.30
+)
+
+// moneyToFloat converts Money to a decimal value rounded to two places. The
+// currency service truncates when packing nanos, so raw conversions arrive with
+// long fractional tails; rounding keeps reported amounts at cent precision.
+func moneyToFloat(m *pb.Money) float64 {
+	v := float64(m.GetUnits()) + float64(m.GetNanos())/1_000_000_000
+	return math.Round(v*100) / 100
+}
+
+// applyPromoDiscount returns a new Money reduced by discountPct percent.
+// Integer arithmetic keeps the result exact for whole-percent discounts.
+func applyPromoDiscount(m *pb.Money, discountPct int64) *pb.Money {
+	if discountPct <= 0 {
+		return m
+	}
+	if discountPct >= 100 {
+		return &pb.Money{CurrencyCode: m.GetCurrencyCode()}
+	}
+	totalNanos := m.GetUnits()*1_000_000_000 + int64(m.GetNanos())
+	kept := totalNanos * (100 - discountPct) / 100
+	return &pb.Money{
+		CurrencyCode: m.GetCurrencyCode(),
+		Units:        kept / 1_000_000_000,
+		Nanos:        int32(kept % 1_000_000_000),
+	}
+}
+
 func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (*pb.PlaceOrderResponse, error) {
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(
-		attribute.String("user.id", req.UserId),
-		attribute.String("demo.user_context.selected_currency", req.UserCurrency),
+		attribute.String("app.user.id", req.UserId),
+		attribute.String("app.user.currency", req.UserCurrency),
 	)
-
-	if flags.EmitRawPii.Value(ctx, openfeature.EvaluationContext{}) {
-		span.SetAttributes(
-			attribute.String("user.email", req.GetEmail()),
-			attribute.String("demo.payment.card_number", req.GetCreditCard().GetCreditCardNumber()),
-			attribute.Int("demo.payment.card_cvv", int(req.GetCreditCard().GetCreditCardCvv())),
-		)
-	}
-
-	if baggage.FromContext(ctx).Member("synthetic_request").Value() == "true" {
-		span.SetAttributes(attribute.String("user_agent.synthetic.type", "test"))
-	}
-
 	logger.LogAttrs(
 		ctx,
 		slog.LevelInfo, "[PlaceOrder]",
@@ -341,30 +370,87 @@ func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (
 		return nil, status.Errorf(codes.Internal, "failed to generate order uuid")
 	}
 
+	logger.InfoContext(ctx, "entering order preparation", slog.String("order_id", orderID.String()))
 	prep, err := cs.prepareOrderItemsAndShippingQuoteFromCart(ctx, req.UserId, req.UserCurrency, req.Address)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		// Return FailedPrecondition for empty cart (client error), Internal for other errors
+		if err.Error() == "cannot place order with empty cart" {
+			return nil, status.Errorf(codes.FailedPrecondition, err.Error())
+		}
+		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	span.AddEvent("prepared")
+	logger.InfoContext(ctx, "leaving order preparation",
+		slog.Int("order_items", len(prep.orderItems)))
 
-	total := &pb.Money{
-		CurrencyCode: req.UserCurrency,
-		Units:        0,
-		Nanos:        0,
-	}
+	total := &pb.Money{CurrencyCode: req.UserCurrency,
+		Units: 0,
+		Nanos: 0}
 	total = money.Must(money.Sum(total, prep.shippingCostLocalized))
 	for _, it := range prep.orderItems {
 		multPrice := money.MultiplySlow(it.Cost, uint32(it.GetItem().GetQuantity()))
 		total = money.Must(money.Sum(total, multPrice))
 	}
 
-	txID, err := cs.chargeCard(ctx, total, req.CreditCard)
+	// Resolve the promo code for this order. The promoDiscountBug flag enables the
+	// promo engine; while enabled, promoRedemptionRate of orders redeem a code and
+	// the flag value decides what share of those redemptions incorrectly match the
+	// internal PROMOTEST100 test code instead of the live SPRING10 campaign. With
+	// the flag off no promo is applied at all, so the default behaviour of the demo
+	// is unchanged. Only the charged amount is affected -- the order items, shipping
+	// cost and the confirmation sent back to the customer all keep the full price.
+	promoCode := noPromoCode
+	discountPct := int64(0)
+	if bugRate := cs.getFeatureFlagFloat(ctx, "promoDiscountBug", 0.0); bugRate > 0 && rand.Float64() < promoRedemptionRate {
+		if rand.Float64() < bugRate {
+			promoCode = testPromoCode
+			discountPct = testPromoDiscount
+		} else {
+			promoCode = livePromoCode
+			discountPct = livePromoDiscount
+		}
+	}
+	chargeTotal := applyPromoDiscount(total, discountPct)
+
+	logger.InfoContext(ctx, "order total calculated",
+		slog.String("currency", chargeTotal.GetCurrencyCode()),
+		slog.Int64("units", chargeTotal.GetUnits()))
+	logger.InfoContext(ctx, "promo code resolved", slog.String("promo_code", promoCode))
+	logger.InfoContext(ctx, "entering payment service", slog.String("order_id", orderID.String()))
+	txID, err := cs.chargeCard(ctx, chargeTotal, req.CreditCard)
 	if err != nil {
+		logger.InfoContext(ctx, "leaving payment service", slog.String("result", "declined"))
+		// Unwind breadcrumbs. Without these the payment error is the last log
+		// line in the whole trace, which hands the root cause to the viewer
+		// before they have looked at anything. Each line states something that
+		// is actually true about the abandoned order, so the trail stays
+		// honest while the failure sits in the middle of the stream rather
+		// than at the end.
+		logger.InfoContext(ctx, "payment declined, unwinding order",
+			slog.String("user_id", req.UserId))
+		logger.InfoContext(ctx, "no transaction id returned by payment service")
+		logger.InfoContext(ctx, "cart left intact for retry",
+			slog.String("user_id", req.UserId))
+		logger.InfoContext(ctx, "shipping order not placed")
+		logger.InfoContext(ctx, "order confirmation email not sent")
+		logger.InfoContext(ctx, "order not published to orders topic")
+		logger.InfoContext(ctx, "order total not recorded for reporting")
+		for _, it := range prep.orderItems {
+			logger.InfoContext(ctx, "order item not charged",
+				slog.String("product_id", it.GetItem().GetProductId()),
+				slog.Int("quantity", int(it.GetItem().GetQuantity())))
+		}
+		logger.InfoContext(ctx, "promo code not redeemed", slog.String("promo_code", promoCode))
+		logger.InfoContext(ctx, "order id released", slog.String("order_id", orderID.String()))
+		logger.InfoContext(ctx, "returning INTERNAL to caller")
+		logger.InfoContext(ctx, "leaving PlaceOrder",
+			slog.String("user_id", req.UserId),
+			slog.String("outcome", "abandoned"))
 		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
 	}
 
 	span.AddEvent("charged",
-		trace.WithAttributes(attribute.String("demo.payment.transaction.id", txID)))
+		trace.WithAttributes(attribute.String("app.payment.transaction.id", txID)))
 	logger.LogAttrs(
 		ctx,
 		slog.LevelInfo, "payment went through",
@@ -375,7 +461,7 @@ func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
-	shippingTrackingAttribute := attribute.String("demo.shipping.tracking.id", shippingTrackingID)
+	shippingTrackingAttribute := attribute.String("app.shipping.tracking.id", shippingTrackingID)
 	span.AddEvent("shipped", trace.WithAttributes(shippingTrackingAttribute))
 
 	_ = cs.emptyUserCart(ctx, req.UserId)
@@ -388,24 +474,47 @@ func (cs *checkout) PlaceOrder(ctx context.Context, req *pb.PlaceOrderRequest) (
 		Items:              prep.orderItems,
 	}
 
-	shippingCostFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", prep.shippingCostLocalized.GetUnits(), prep.shippingCostLocalized.GetNanos()/10000000), 64)
-	totalPriceFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", total.GetUnits(), total.GetNanos()/10000000), 64)
+	// Normalize to USD so revenue can be aggregated across currencies. This runs
+	// after the charge so it stays off the payment path. The promo discount is a
+	// flat percentage, so converting the pre-discount total once and re-applying
+	// the discount avoids a second currency conversion.
+	totalUSD := total
+	if total.GetCurrencyCode() != "USD" {
+		if convertedUSD, cerr := cs.convertCurrency(ctx, total, "USD"); cerr == nil {
+			totalUSD = convertedUSD
+		} else {
+			logger.Warn(fmt.Sprintf("failed to convert order total to USD for reporting: %+v", cerr))
+		}
+	}
+	chargeTotalUSD := applyPromoDiscount(totalUSD, discountPct)
+
+	shippingCostFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", prep.shippingCostLocalized.GetUnits(), prep.shippingCostLocalized.GetNanos()/1000000000), 64)
+	totalPriceFloat := moneyToFloat(total)
+	chargedPriceFloat := moneyToFloat(chargeTotal)
+	totalUSDFloat := moneyToFloat(totalUSD)
+	chargedUSDFloat := moneyToFloat(chargeTotalUSD)
 
 	span.SetAttributes(
-		attribute.String("demo.order.id", orderID.String()),
-		attribute.Float64("demo.shipping.amount", shippingCostFloat),
-		attribute.Float64("demo.order.amount", totalPriceFloat),
-		attribute.Int("demo.order.items.count", len(prep.orderItems)),
+		attribute.String("app.order.id", orderID.String()),
+		attribute.Float64("app.shipping.amount", shippingCostFloat),
+		attribute.Float64("app.order.amount", totalPriceFloat),
+		attribute.Int("app.order.items.count", len(prep.orderItems)),
 		shippingTrackingAttribute,
 	)
 	logger.LogAttrs(
 		ctx,
 		slog.LevelInfo, "order placed",
-		slog.String("demo.order.id", orderID.String()),
-		slog.Float64("demo.shipping.amount", shippingCostFloat),
-		slog.Float64("demo.order.amount", totalPriceFloat),
-		slog.Int("demo.order.items.count", len(prep.orderItems)),
-		slog.String("demo.shipping.tracking.id", shippingTrackingID),
+		slog.String("app.order.id", orderID.String()),
+		slog.Float64("app.shipping.amount", shippingCostFloat),
+		slog.Float64("app.order.amount", totalPriceFloat),
+		slog.Float64("app.order.amount.charged", chargedPriceFloat),
+		slog.String("app.order.currency", total.GetCurrencyCode()),
+		slog.Float64("app.order.amount.usd", totalUSDFloat),
+		slog.Float64("app.order.amount.charged.usd", chargedUSDFloat),
+		slog.String("app.promo.code", promoCode),
+		slog.Float64("app.order.discount.pct", float64(discountPct)),
+		slog.Int("app.order.items.count", len(prep.orderItems)),
+		slog.String("app.shipping.tracking.id", shippingTrackingID),
 	)
 
 	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
@@ -431,26 +540,44 @@ type orderPrep struct {
 }
 
 func (cs *checkout) prepareOrderItemsAndShippingQuoteFromCart(ctx context.Context, userID, userCurrency string, address *pb.Address) (orderPrep, error) {
+
 	ctx, span := tracer.Start(ctx, "prepareOrderItemsAndShippingQuoteFromCart")
 	defer span.End()
 
 	var out orderPrep
+
+	logger.InfoContext(ctx, "entering cart service", slog.String("user_id", userID))
 	cartItems, err := cs.getUserCart(ctx, userID)
 	if err != nil {
 		return out, fmt.Errorf("cart failure: %+v", err)
 	}
+	logger.InfoContext(ctx, "leaving cart service", slog.Int("items", len(cartItems)))
+
+	// Validate cart is not empty before proceeding
+	if len(cartItems) == 0 {
+		return out, fmt.Errorf("cannot place order with empty cart")
+	}
+
+	logger.InfoContext(ctx, "entering product catalog service")
 	orderItems, err := cs.prepOrderItems(ctx, cartItems, userCurrency)
 	if err != nil {
 		return out, fmt.Errorf("failed to prepare order: %+v", err)
 	}
+	logger.InfoContext(ctx, "leaving product catalog service", slog.Int("order_items", len(orderItems)))
+
+	logger.InfoContext(ctx, "entering shipping service")
 	shippingUSD, err := cs.quoteShipping(ctx, address, cartItems)
 	if err != nil {
 		return out, fmt.Errorf("shipping quote failure: %+v", err)
 	}
+	logger.InfoContext(ctx, "leaving shipping service")
+
+	logger.InfoContext(ctx, "entering currency service", slog.String("target_currency", userCurrency))
 	shippingPrice, err := cs.convertCurrency(ctx, shippingUSD, userCurrency)
 	if err != nil {
 		return out, fmt.Errorf("failed to convert shipping cost to currency: %+v", err)
 	}
+	logger.InfoContext(ctx, "leaving currency service")
 
 	out.shippingCostLocalized = shippingPrice
 	out.cartItems = cartItems
@@ -460,20 +587,24 @@ func (cs *checkout) prepareOrderItemsAndShippingQuoteFromCart(ctx context.Contex
 	for _, ci := range cartItems {
 		totalCart += ci.Quantity
 	}
-	shippingCostFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", shippingPrice.GetUnits(), shippingPrice.GetNanos()/10000000), 64)
+	shippingCostFloat, _ := strconv.ParseFloat(fmt.Sprintf("%d.%02d", shippingPrice.GetUnits(), shippingPrice.GetNanos()/1000000000), 64)
 
 	span.SetAttributes(
-		attribute.Float64("demo.shipping.amount", shippingCostFloat),
-		attribute.Int("demo.cart.items.count", int(totalCart)),
-		attribute.Int("demo.order.items.count", len(orderItems)),
+		attribute.Float64("app.shipping.amount", shippingCostFloat),
+		attribute.Int("app.cart.items.count", int(totalCart)),
+		attribute.Int("app.order.items.count", len(orderItems)),
 	)
 	return out, nil
 }
 
-func mustCreateClient(svcAddr string) *grpc.ClientConn {
+func mustCreateClient(svcAddr string, peerService string) *grpc.ClientConn {
 	c, err := grpc.NewClient(svcAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+			otelgrpc.WithSpanOptions(trace.WithAttributes(
+				attribute.String("peer.service", peerService),
+			)),
+		)),
 	)
 	if err != nil {
 		logger.Error(fmt.Sprintf("could not connect to %s service, err: %+v", svcAddr, err))
@@ -483,6 +614,11 @@ func mustCreateClient(svcAddr string) *grpc.ClientConn {
 }
 
 func (cs *checkout) quoteShipping(ctx context.Context, address *pb.Address, items []*pb.CartItem) (*pb.Money, error) {
+	// Ensure items is an empty array instead of null when cart is empty
+	if items == nil {
+		items = []*pb.CartItem{}
+	}
+
 	quotePayload, err := json.Marshal(map[string]interface{}{
 		"address": address,
 		"items":   items,
@@ -553,8 +689,7 @@ func (cs *checkout) prepOrderItems(ctx context.Context, items []*pb.CartItem, us
 		}
 		out[i] = &pb.OrderItem{
 			Item: item,
-			Cost: price,
-		}
+			Cost: price}
 	}
 	return out, nil
 }
@@ -562,26 +697,81 @@ func (cs *checkout) prepOrderItems(ctx context.Context, items []*pb.CartItem, us
 func (cs *checkout) convertCurrency(ctx context.Context, from *pb.Money, toCurrency string) (*pb.Money, error) {
 	result, err := cs.currencySvcClient.Convert(ctx, &pb.CurrencyConversionRequest{
 		From:   from,
-		ToCode: toCurrency,
-	})
+		ToCode: toCurrency})
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert currency: %+v", err)
 	}
 	return result, err
 }
 
+// chargeCard routes payment requests to payment-va or payment-vb service.
+//
+// Payment Routing Behavior:
+//   - If x-payment-path header is present (rumBlueGreen flag ON in frontend):
+//     Uses the header value ('payment-a' -> payment-va, 'payment-b' -> payment-vb)
+//     This enables RUM to track payment path from session start to checkout.
+//   - If header is absent (rumBlueGreen flag OFF or missing):
+//     Uses paymentFailure flag probability to randomly route requests.
+//     e.g., paymentFailure=0.5 means 50% go to payment-vb.
+//     Default (paymentFailure=0) routes 100% to payment-va.
 func (cs *checkout) chargeCard(ctx context.Context, amount *pb.Money, paymentInfo *pb.CreditCardInfo) (string, error) {
 	paymentService := cs.paymentSvcClient
-	if flags.PaymentUnreachable.Value(ctx, openfeature.EvaluationContext{}) {
+
+	// Check for intentional failure mode (uses existing paymentUnreachable flag)
+	if cs.isFeatureFlagEnabled(ctx, "paymentUnreachable") {
 		badAddress := "badAddress:50051"
-		c := mustCreateClient(badAddress)
+		c := mustCreateClient(badAddress, "payment")
+		paymentService = pb.NewPaymentServiceClient(c)
+	} else {
+		var paymentAddr string
+
+		// Check for frontend-determined payment path (from RUM blue/green feature)
+		// This header is set when rumBlueGreen flag is enabled in frontend
+		paymentPath := ""
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if values := md.Get("x-payment-path"); len(values) > 0 {
+				paymentPath = values[0]
+			}
+		}
+
+		if paymentPath == "payment-b" {
+			// Frontend determined: route to version B
+			paymentAddr = "payment-vb:8080"
+			logger.Info("Using frontend-determined payment path: B (from x-payment-path header)")
+		} else if paymentPath == "payment-a" {
+			// Frontend determined: route to version A
+			paymentAddr = "payment-va:8080"
+			logger.Info("Using frontend-determined payment path: A (from x-payment-path header)")
+		} else {
+			// Fallback: existing flag-based decision (rumBlueGreen not enabled or header missing)
+			// Use paymentFailure flag to route between payment version A and B
+			// paymentFailure=0   → 100% to version A
+			// paymentFailure=0.5 → 50% to A, 50% to B
+			// paymentFailure=1   → 100% to version B
+			paymentFailureProbability := cs.getFeatureFlagFloat(ctx, "paymentFailure", 0.0)
+
+			// Generate random number to determine routing
+			shouldRouteToB := rand.Float64() < paymentFailureProbability
+
+			if shouldRouteToB {
+				// Route to version B (optimized/faster)
+				paymentAddr = "payment-vb:8080"
+			} else {
+				// Route to version A (stable/conservative)
+				paymentAddr = "payment-va:8080"
+			}
+			logger.Info(fmt.Sprintf("Using backend flag-based payment path decision: %s", paymentAddr))
+		}
+
+		// Create client for selected version
+		c := mustCreateClient(paymentAddr, "payment")
+		defer c.Close()
 		paymentService = pb.NewPaymentServiceClient(c)
 	}
 
 	paymentResp, err := paymentService.Charge(ctx, &pb.ChargeRequest{
 		Amount:     amount,
-		CreditCard: paymentInfo,
-	})
+		CreditCard: paymentInfo})
 	if err != nil {
 		return "", fmt.Errorf("could not charge the card: %+v", err)
 	}
@@ -597,10 +787,7 @@ func (cs *checkout) sendOrderConfirmation(ctx context.Context, email string, ord
 		return fmt.Errorf("failed to marshal order to JSON: %+v", err)
 	}
 
-	emailCtx, cancel := context.WithTimeout(ctx, emailRequestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(emailCtx, "POST", cs.emailSvcAddr+"/send_order_confirmation", bytes.NewBuffer(emailPayload))
+	req, err := http.NewRequestWithContext(ctx, "POST", cs.emailSvcAddr+"/send_order_confirmation", bytes.NewBuffer(emailPayload))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %+v", err)
 	}
@@ -619,6 +806,11 @@ func (cs *checkout) sendOrderConfirmation(ctx context.Context, email string, ord
 }
 
 func (cs *checkout) shipOrder(ctx context.Context, address *pb.Address, items []*pb.CartItem) (string, error) {
+	// Ensure items is an empty array instead of null when cart is empty
+	if items == nil {
+		items = []*pb.CartItem{}
+	}
+
 	shipPayload, err := json.Marshal(map[string]interface{}{
 		"address": address,
 		"items":   items,
@@ -713,14 +905,14 @@ func (cs *checkout) sendToPostProcessor(ctx context.Context, result *pb.OrderRes
 		return
 	}
 
-	ffValue := flags.KafkaQueueProblems.Value(ctx, openfeature.EvaluationContext{})
+	ffValue := cs.getIntFeatureFlag(ctx, "kafkaQueueProblems")
 	if ffValue > 0 {
 		logger.Info("Warning: FeatureFlag 'kafkaQueueProblems' is activated, overloading queue now.")
-		for range ffValue {
-			go func(msg sarama.ProducerMessage) {
+		for i := 0; i < ffValue; i++ {
+			go func(i int) {
 				cs.KafkaProducerClient.Input() <- &msg
-				<-cs.KafkaProducerClient.Successes()
-			}(msg)
+				_ = <-cs.KafkaProducerClient.Successes()
+			}(i)
 		}
 		logger.Info(fmt.Sprintf("Done with #%d messages for overload simulation.", ffValue))
 	}
@@ -750,4 +942,60 @@ func createProducerSpan(ctx context.Context, msg *sarama.ProducerMessage) trace.
 	}
 
 	return span
+}
+
+func (cs *checkout) isFeatureFlagEnabled(ctx context.Context, featureFlagName string) bool {
+	client := openfeature.NewClient("checkout")
+
+	// Default value is set to false, but you could also make this a parameter.
+	featureEnabled, _ := client.BooleanValue(
+		ctx,
+		featureFlagName,
+		false,
+		openfeature.EvaluationContext{},
+	)
+
+	return featureEnabled
+}
+
+func (cs *checkout) getIntFeatureFlag(ctx context.Context, featureFlagName string) int {
+	client := openfeature.NewClient("checkout")
+
+	// Default value is set to 0, but you could also make this a parameter.
+	featureFlagValue, _ := client.IntValue(
+		ctx,
+		featureFlagName,
+		0,
+		openfeature.EvaluationContext{},
+	)
+
+	return int(featureFlagValue)
+}
+
+func (cs *checkout) getFeatureFlagString(ctx context.Context, featureFlagName string, defaultValue string) string {
+	client := openfeature.NewClient("checkout")
+
+	// Get string value from feature flag
+	featureFlagValue, _ := client.StringValue(
+		ctx,
+		featureFlagName,
+		defaultValue,
+		openfeature.EvaluationContext{},
+	)
+
+	return featureFlagValue
+}
+
+func (cs *checkout) getFeatureFlagFloat(ctx context.Context, featureFlagName string, defaultValue float64) float64 {
+	client := openfeature.NewClient("checkout")
+
+	// Get float value from feature flag
+	featureFlagValue, _ := client.FloatValue(
+		ctx,
+		featureFlagName,
+		defaultValue,
+		openfeature.EvaluationContext{},
+	)
+
+	return featureFlagValue
 }

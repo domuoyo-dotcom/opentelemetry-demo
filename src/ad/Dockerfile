@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-FROM --platform=${BUILDPLATFORM} docker.io/library/eclipse-temurin:24.0.2_12-jdk@sha256:7493205ffe6caa8074fa8a06a276bb1c5ac41d3dd0fd43a0db66d7f776e80b3e AS builder
+FROM --platform=${BUILDPLATFORM} eclipse-temurin:21-jdk AS builder
+ARG _JAVA_OPTIONS
 WORKDIR /usr/src/app/
 
 COPY ./src/ad/gradlew* ./src/ad/settings.gradle* ./src/ad/build.gradle ./
@@ -18,18 +19,18 @@ RUN chmod +x ./gradlew
 RUN ./gradlew installDist -PprotoSourceDir=./proto
 
 # -----------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre
 
-FROM docker.io/library/eclipse-temurin:24.0.2_12-jre@sha256:8cb2387a28af84cf0db0948d9c67d4480192f4e567027a3963f145d218e8b4f2
+# Grab the latest Splunk OpenTelemetry Java agent (because "latest" is apparently a lifestyle)
+# ADD --chmod=644 https://github.com/signalfx/splunk-otel-java/releases/latest/download/splunk-otel-javaagent.jar /usr/src/app/splunk-otel-javaagent.jar
+ADD --chmod=644 https://repo1.maven.org/maven2/com/splunk/splunk-otel-javaagent-csa/2.27.0/splunk-otel-javaagent-csa-2.27.0.jar  /usr/src/app/splunk-otel-javaagent-csa.jar
 
-ARG OTEL_JAVA_AGENT_VERSION
 WORKDIR /usr/src/app/
-
 COPY --from=builder /usr/src/app/ ./
-ADD --chmod=644 https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v$OTEL_JAVA_AGENT_VERSION/opentelemetry-javaagent.jar /usr/src/app/opentelemetry-javaagent.jar
-ENV JAVA_TOOL_OPTIONS="-javaagent:/usr/src/app/opentelemetry-javaagent.jar -Xmx200m"
 
-ARG AD_PORT=9555
-ARG AD_PROMETHEUS_PORT=9465
+# Auto-instrumentation: Splunk agent handled in the k8s manifest
+#ENV JAVA_TOOL_OPTIONS="-javaagent:/usr/src/app/splunk-otel-javaagent.jar"
+
 EXPOSE ${AD_PORT}
-EXPOSE ${AD_PROMETHEUS_PORT}
 ENTRYPOINT [ "./build/install/opentelemetry-demo-ad/bin/Ad" ]
+# ENTRYPOINT [ "tail", "-f", "/dev/null" ]

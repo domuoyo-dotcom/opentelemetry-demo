@@ -5,8 +5,6 @@ package main
 //go:generate go install google.golang.org/protobuf/cmd/protoc-gen-go
 //go:generate go install google.golang.org/grpc/cmd/protoc-gen-go-grpc
 //go:generate protoc --go_out=./ --go-grpc_out=./ --proto_path=../../pb ../../pb/demo.proto
-//go:generate go install github.com/open-feature/cli/cmd/openfeature@v0.4.0
-//go:generate openfeature generate -o flags --package-name flags go
 
 import (
 	"context"
@@ -17,21 +15,25 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc/filters"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
-	"go.opentelemetry.io/contrib/otelconf"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -47,7 +49,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/XSAM/otelsql"
-	flags "github.com/opentelemetry/opentelemetry-demo/src/product-catalog/flags"
 )
 
 type productCatalog struct {
@@ -60,8 +61,60 @@ var (
 	reg    metric.Registration
 )
 
+// multiHandler fans out log records to multiple slog handlers,
+// ensuring logs reach both stderr and OTLP.
+type multiHandler struct {
+	handlers []slog.Handler
+}
+
+func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multiHandler) Handle(ctx context.Context, record slog.Record) error {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, record.Level) {
+			_ = h.Handle(ctx, record.Clone())
+		}
+	}
+	return nil
+}
+
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithAttrs(attrs)
+	}
+	return &multiHandler{handlers: handlers}
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithGroup(name)
+	}
+	return &multiHandler{handlers: handlers}
+}
+
 func init() {
-	logger = otelslog.NewLogger("product-catalog")
+	// Start with stdout logger for pre-OTel-init messages
+	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+}
+
+// dsnField extracts a key=value field from a libpq keyword/value DSN
+// (e.g. "host=postgresql dbname=astroshop"). Returns "" if absent.
+func dsnField(dsn, key string) string {
+	for _, part := range strings.Fields(dsn) {
+		if k, v, ok := strings.Cut(part, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
 }
 
 func initDatabase() error {
@@ -70,14 +123,24 @@ func initDatabase() error {
 		return fmt.Errorf("DB_CONNECTION_STRING environment variable not set")
 	}
 
-	dbAttrs := otelsql.WithAttributes(
-		append(otelsql.AttributesFromDSN(connStr), semconv.DBSystemNamePostgreSQL)...,
-	)
+	// otelsql.AttributesFromDSN only sets server.address/server.port — it does
+	// NOT emit the database name. Set it explicitly under both the new
+	// (db.namespace) and old (db.name) semconv keys, parsed from the DSN, so
+	// product-catalog's DB identity resolves to "astroshop" consistently with
+	// the services that emit new semconv (e.g. order-ledger via the Java
+	// agent) and those still on the old key.
+	attrs := append(otelsql.AttributesFromDSN(connStr), semconv.DBSystemNamePostgreSQL)
+	if dbName := dsnField(connStr, "dbname"); dbName != "" {
+		attrs = append(attrs,
+			semconv.DBNamespace(dbName),         // new semconv: db.namespace
+			attribute.String("db.name", dbName), // old semconv: db.name
+		)
+	}
+	dbAttrs := otelsql.WithAttributes(attrs...)
 
 	var err error
 	db, err = otelsql.Open("postgres", connStr,
 		dbAttrs,
-		otelsql.WithSQLCommenter(true),
 		otelsql.WithSpanOptions(otelsql.SpanOptions{
 			OmitConnResetSession: true,
 			OmitRows:             true,
@@ -101,37 +164,59 @@ func initDatabase() error {
 }
 
 func main() {
+	fmt.Fprintln(os.Stdout, "product-catalog: starting up")
 	ctx := context.Background()
 
-	opAMPIdentity, err := prepareOpAMPIdentity()
-	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to prepare OpAMP identity: %v", err))
-	}
+	// Initialize OpenTelemetry SDK with standard OTLP gRPC exporters
+	// Reads OTEL_EXPORTER_OTLP_ENDPOINT from env automatically.
+	fmt.Fprintln(os.Stdout, "product-catalog: initializing OpenTelemetry SDK")
 
-	// Initialize OpenTelemetry SDK with otelconf
-	sdk, err := otelconf.NewSDK(otelconf.WithContext(ctx))
+	traceExporter, err := otlptracegrpc.New(ctx)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to initialize OpenTelemetry SDK: %v", err))
+		fmt.Fprintf(os.Stderr, "FATAL: trace exporter: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := sdk.Shutdown(ctx); err != nil {
-			logger.Error(fmt.Sprintf("Error shutting down OpenTelemetry SDK: %v", err))
-		}
-		logger.Info("Shutdown OpenTelemetry SDK")
-	}()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExporter))
+	defer tp.Shutdown(ctx)
 
-	// Set global providers and propagator
-	otel.SetTracerProvider(sdk.TracerProvider())
-	otel.SetMeterProvider(sdk.MeterProvider())
-	global.SetLoggerProvider(sdk.LoggerProvider())
-	otel.SetTextMapPropagator(sdk.Propagator())
+	metricExporter, err := otlpmetricgrpc.New(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: metric exporter: %v\n", err)
+		os.Exit(1)
+	}
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter)))
+	defer mp.Shutdown(ctx)
+
+	logExporter, err := otlploggrpc.New(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: log exporter: %v\n", err)
+		os.Exit(1)
+	}
+	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)))
+	defer lp.Shutdown(ctx)
+
+	otel.SetTracerProvider(tp)
+	otel.SetMeterProvider(mp)
+	global.SetLoggerProvider(lp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	fmt.Fprintln(os.Stdout, "product-catalog: OpenTelemetry SDK initialized")
+
+	// Upgrade to dual logger: stdout + OTLP
+	logger = slog.New(&multiHandler{
+		handlers: []slog.Handler{
+			slog.NewTextHandler(os.Stdout, nil),
+			otelslog.NewHandler("product-catalog"),
+		},
+	})
 
 	// Initialize database connection
+	fmt.Fprintln(os.Stdout, "product-catalog: connecting to database")
 	if err := initDatabase(); err != nil {
-		logger.Error(fmt.Sprintf("Error initializing database: %v", err))
+		fmt.Fprintf(os.Stderr, "FATAL: Error initializing database: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Fprintln(os.Stdout, "product-catalog: database connection established")
 	defer func() {
 		if db != nil {
 			if err := db.Close(); err != nil {
@@ -149,55 +234,35 @@ func main() {
 		}
 	}()
 
+	fmt.Fprintln(os.Stdout, "product-catalog: initializing feature flags (flagd)")
 	openfeature.AddHooks(otelhooks.NewTracesHook())
 	provider, err := flagd.NewProvider()
 	if err != nil {
-		logger.Error("Error creating flagd provider", slog.Any("error", err))
+		logger.Error(err.Error())
 	}
-
 	err = openfeature.SetProvider(provider)
 	if err != nil {
-		logger.Error("Failed to set flagd as the provider", slog.Any("error", err))
+		logger.Error(err.Error())
 	}
-	defer openfeature.Shutdown()
-
-	go triggerLockContentionLoop(ctx)
 
 	err = runtime.Start(runtime.WithMinimumReadMemStatsInterval(time.Second))
 	if err != nil {
 		logger.Error(err.Error())
 	}
 
-	opAMPClient, err := startOpAMPClient(context.Background(), opAMPIdentity)
-	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to start OpAMP client: %v", err))
-	} else if opAMPClient != nil {
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := opAMPClient.Stop(shutdownCtx); err != nil {
-				logger.Error(fmt.Sprintf("Error stopping OpAMP client: %v", err))
-			} else {
-				logger.Info("Stopped OpAMP client")
-			}
-		}()
-	}
-
 	svc := &productCatalog{}
 	var port string
 	mustMapEnv(&port, "PRODUCT_CATALOG_PORT")
 
-	logger.Info(fmt.Sprintf("Product Catalog gRPC server started on port: %s", port))
-
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		logger.Error(fmt.Sprintf("TCP Listen: %v", err))
+		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stdout, "product-catalog: gRPC server listening on port %s\n", port)
 
 	srv := grpc.NewServer(
-		grpc.StatsHandler(otelgrpc.NewServerHandler(
-			otelgrpc.WithFilter(filters.Not(filters.HealthCheck())),
-		)),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 
 	reflection.Register(srv)
@@ -207,7 +272,7 @@ func main() {
 	healthcheck := health.NewServer()
 	healthpb.RegisterHealthServer(srv, healthcheck)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 	defer cancel()
 
 	go func() {
@@ -359,6 +424,7 @@ func mustMapEnv(target *string, key string) {
 	value, present := os.LookupEnv(key)
 	if !present {
 		logger.Error(fmt.Sprintf("Environment Variable Not Set: %q", key))
+		os.Exit(1)
 	}
 	*target = value
 }
@@ -381,7 +447,7 @@ func (p *productCatalog) ListProducts(ctx context.Context, req *pb.Empty) (*pb.L
 	}
 
 	span.SetAttributes(
-		attribute.Int("demo.product.count", len(products)),
+		attribute.Int("app.products.count", len(products)),
 	)
 	return &pb.ListProductsResponse{Products: products}, nil
 }
@@ -389,7 +455,7 @@ func (p *productCatalog) ListProducts(ctx context.Context, req *pb.Empty) (*pb.L
 func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductRequest) (*pb.Product, error) {
 	span := trace.SpanFromContext(ctx)
 	span.SetAttributes(
-		attribute.String("demo.product.id", req.Id),
+		attribute.String("app.product.id", req.Id),
 	)
 
 	// GetProduct will fail on a specific product when feature flag is enabled
@@ -397,7 +463,7 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
 		msg := "Error: Product Catalog Fail Feature Flag Enabled"
 		span.SetStatus(otelcodes.Error, msg)
 		span.AddEvent(msg)
-		return nil, status.Error(codes.Internal, msg)
+		return nil, status.Errorf(codes.Internal, msg)
 	}
 
 	found, err := getProductFromDB(ctx, req.Id)
@@ -405,20 +471,20 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
 		msg := fmt.Sprintf("Product Not Found: %s", req.Id)
 		span.SetStatus(otelcodes.Error, msg)
 		span.AddEvent(msg)
-		return nil, status.Error(codes.NotFound, msg)
+		return nil, status.Errorf(codes.NotFound, msg)
 	}
 
 	span.AddEvent("Product Found")
 	span.SetAttributes(
-		attribute.String("demo.product.id", req.Id),
-		attribute.String("demo.product.name", found.Name),
+		attribute.String("app.product.id", req.Id),
+		attribute.String("app.product.name", found.Name),
 	)
 
 	logger.LogAttrs(
 		ctx,
 		slog.LevelInfo, "Product Found",
-		slog.String("demo.product.name", found.Name),
-		slog.String("demo.product.id", req.Id),
+		slog.String("app.product.name", found.Name),
+		slog.String("app.product.id", req.Id),
 	)
 
 	return found, nil
@@ -434,52 +500,19 @@ func (p *productCatalog) SearchProducts(ctx context.Context, req *pb.SearchProdu
 	}
 
 	span.SetAttributes(
-		attribute.Int("demo.product.search.count", len(result)),
+		attribute.Int("app.products_search.count", len(result)),
 	)
 	return &pb.SearchProductsResponse{Results: result}, nil
 }
 
 func (p *productCatalog) checkProductFailure(ctx context.Context, id string) bool {
-	return flags.ProductCatalogFailure.Value(ctx, openfeature.NewTargetlessEvaluationContext(map[string]any{"product_id": id}))
-}
-
-func triggerLockContentionLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	var locking atomic.Bool
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			enabled := flags.ProductCatalogLockContention.Value(ctx, openfeature.NewTargetlessEvaluationContext(nil))
-			if enabled && locking.CompareAndSwap(false, true) {
-				go func() {
-					defer locking.Store(false)
-					triggerLockContention(ctx)
-				}()
-			}
-		}
-	}
-}
-
-func triggerLockContention(ctx context.Context) {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("failed to begin lock contention transaction", slog.Any("error", err))
-		return
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "LOCK TABLE catalog.products IN ACCESS EXCLUSIVE MODE"); err != nil {
-		logger.Error("failed to acquire lock for lock contention scenario", slog.Any("error", err))
-		return
+	if id != "OLJCESPC7Z" {
+		return false
 	}
 
-	logger.Info("lock contention scenario active: holding ACCESS EXCLUSIVE lock on catalog.products")
-	select {
-	case <-ctx.Done():
-	case <-time.After(30 * time.Second):
-	}
+	client := openfeature.NewClient("productCatalog")
+	failureEnabled, _ := client.BooleanValue(
+		ctx, "productCatalogFailure", false, openfeature.EvaluationContext{},
+	)
+	return failureEnabled
 }

@@ -1,0 +1,256 @@
+# Splunk Astronomy Shop Services Configuration
+# This file defines all services in the project for manifest stitching and container builds
+#
+# To add a new service:
+# 1. Add an entry to the 'services' list below
+# 2. Ensure your service has a [service-name]-k8s.yaml file in src/[service-name]/
+# 3. Optionally add build configuration if the service needs container builds
+#
+# Format:
+#   name: Service directory name (must match src/ directory)
+#   build: Whether to build containers for this service (true/false)
+#   manifest: Whether to include in manifest stitching (true/false)
+#   replace_registry: Whether to replace registry URL when using dev/prod (true/false, default: true)
+#                     Set to false to keep the original registry from the service's k8s.yaml
+#   dockerfile: Custom Dockerfile path (optional, default: src/{name}/Dockerfile)
+#               Use this when the Dockerfile is in a subdirectory
+#               Example: "src/cart/src/Dockerfile"
+#   build_target: Docker multi-stage build target (optional, default: none)
+#                 Pass `--target <name>` to select one stage. Use when multiple
+#                 svcs share one Dockerfile with per-language targets.
+#                 Example: build_target: java
+#   manifest_file: Custom k8s manifest path (optional, default: src/{name}/{name}-k8s.yaml)
+#                  Use when multiple svc entries share a single combined manifest.
+#                  Stitcher dedupes so the manifest is emitted once even if
+#                  multiple svcs reference it.
+#                  Example: "src/secureapp-loadgen/unified-v2/secureapp-loadgen-k8s.yaml"
+#   platform: Docker build platforms (optional, default: linux/amd64,linux/arm64)
+#             Examples: "linux/amd64" or "linux/amd64,linux/arm64"
+
+# Container Registry Configuration
+# Used by build and manifest generation workflows
+registry:
+  # Production registry - used by production workflows
+  prod: "ghcr.io/splunk/opentelemetry-demo"
+
+  # Development/Test registry - FOR FORKS ONLY
+  # DO NOT add a 'dev' registry here - it's fork-specific
+  # Instead, create dev-repo.yaml (see dev-repo.yaml.example)
+  # The dev-repo.yaml file is gitignored to prevent fork repo URLs in main repo
+
+services:
+  # Must be stitched FIRST: all application pods reference this ServiceAccount
+  # via serviceAccountName. Emitting it ahead of every Deployment avoids the
+  # race where ReplicaSets fail pod creation with "serviceaccount not found".
+  - name: demo-service-account
+    build: false
+    manifest: true
+
+  - name: ingress
+    build: false
+    manifest: false  # Only included in DIAB builds via stitch-manifests.sh
+
+  - name: accounting
+    build: true
+    manifest: true
+
+  - name: ad
+    build: true
+    manifest: true
+
+  - name: astronomy-loadgen
+    build: false
+    manifest: true
+    replace_registry: false  # Keep original registry (ghcr.io/splunk/online-boutique)
+
+  - name: cart
+    build: true
+    manifest: true
+    dockerfile: src/cart/src/Dockerfile
+
+  - name: checkout
+    build: true
+    manifest: true
+    replace_registry: true  # Uses Splunk registry (custom build)
+
+  - name: currency
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: email
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: flagd
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-feature/flagd
+
+  - name: flagd-config
+    build: false
+    manifest: true
+
+  - name: flagd-ui
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: fraud-detection
+    build: true
+    manifest: true
+
+  - name: frontend
+    build: true
+    manifest: true
+
+  - name: frontend-proxy
+    build: true
+    manifest: true
+
+  - name: image-provider
+    build: true
+    manifest: true
+
+  - name: kafka
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: llm
+    build: true
+    manifest: true
+
+
+  - name: demo-namespace
+    build: false
+    manifest: false  # Disabled - using default namespace instead
+
+  - name: payment
+    build: true
+    manifest: true
+
+  - name: planning
+    build: true
+    manifest: true
+    group: lambda
+
+  - name: postgresql-setup
+    build: false
+    manifest: true
+
+  - name: postgresql
+    build: false
+    manifest: true
+    replace_registry: false  # Uses stock postgres image
+
+  - name: product-catalog
+    build: true
+    manifest: true
+
+  - name: product-reviews
+    build: true
+    manifest: true
+
+  - name: quote
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: react-native-app
+    build: false
+    manifest: false
+
+  - name: recommendation
+    build: true
+    manifest: true
+
+  - name: order-validation
+    build: true
+    manifest: true
+    group: throttle-demo
+
+  - name: order-ledger
+    build: true
+    manifest: true   # core service: accounting calls it per order (DB-query <-> APM correlation)
+
+  - name: shipping
+    build: false
+    manifest: true
+    replace_registry: false  # Uses ghcr.io/open-telemetry/demo (standard)
+
+  - name: shop-dc-shim
+    build: true
+    manifest: true
+    group: dc-shim
+
+  - name: shop-dc-shim-db
+    build: false
+    manifest: true
+    replace_registry: false  # Uses mcr.microsoft.com/mssql
+    group: dc-shim
+
+  - name: shop-dc-loadgenerator
+    build: true
+    manifest: true
+    group: dc-shim
+
+  - name: sql-server-fraud-setup
+    build: false
+    manifest: true
+
+  - name: sql-server-fraud
+    build: false
+    manifest: true
+    replace_registry: false  # Uses mcr.microsoft.com/mssql
+
+  - name: thousandeyes
+    build: false
+    manifest: false # false till we sorted out thousand eyes instance and secret issue
+    replace_registry: false  # Uses thousandeyes/enterprise-agent
+
+  # SecureApp loadgen — 3 language variants deployed as NATIVE SIDECARS
+  # (k8s >= 1.29 initContainer with restartPolicy: Always) inside the
+  # target pods:
+  #   secureapp-loadgen-java   -> sidecar in src/ad/ad-k8s.yaml
+  #   secureapp-loadgen-node   -> sidecar in src/frontend/frontend-k8s.yaml
+  #   secureapp-loadgen-python -> sidecar in src/recommendation/recommendation-k8s.yaml
+  # Attacks + vuln endpoints run inside the target pod, share its
+  # network namespace, and report the target's service.name in APM.
+  # Sidecars listen on port 8180 (target apps use 8080).
+  #
+  # Only the images are built here; no standalone Deployment/Service is
+  # emitted for them (manifest: false). To wire a 4th language variant:
+  #   1. Drop apps/<lang>-secureapp-loadgen/ + a Dockerfile target
+  #   2. Add its services.yaml entry with build_target: <lang>
+  #   3. Add the sidecar block to the target pod's manifest
+  - name: secureapp-loadgen-java
+    build: true
+    manifest: false  # sidecar lives in ad-k8s.yaml, not standalone
+    platform: "linux/amd64"
+    dockerfile: src/secureapp-loadgen/unified-v2/Dockerfile
+    build_target: java
+    # manifest_file tells update-manifest-images.py where to sedge the
+    # sidecar image tag on release (scoped by image_name so it only
+    # touches the secureapp line, not the target's own image line).
+    manifest_file: src/ad/ad-k8s.yaml
+  - name: secureapp-loadgen-node
+    build: true
+    manifest: false  # sidecar lives in frontend-k8s.yaml
+    platform: "linux/amd64"
+    dockerfile: src/secureapp-loadgen/unified-v2/Dockerfile
+    build_target: node
+    manifest_file: src/frontend/frontend-k8s.yaml
+  - name: secureapp-loadgen-python
+    build: true
+    manifest: false  # sidecar lives in recommendation-k8s.yaml
+    platform: "linux/amd64"
+    dockerfile: src/secureapp-loadgen/unified-v2/Dockerfile
+    build_target: python
+    manifest_file: src/recommendation/recommendation-k8s.yaml
+
+  - name: valkey-cart
+    build: false
+    manifest: true
+    replace_registry: false  # Uses valkey/valkey for thtis REDIS DB

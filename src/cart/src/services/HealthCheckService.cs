@@ -3,7 +3,6 @@
 
 using System;
 
-using cart;
 using Grpc.Core;
 using Grpc.HealthCheck;
 using Grpc.Health.V1;
@@ -62,7 +61,10 @@ namespace cart.healthcheck
 
         public override async Task<HealthCheckResponse> Check(HealthCheckRequest request, ServerCallContext context)
         {
-           Log.HealthCheckRequest(_logger, request.Service);
+           if (_logger.IsEnabled(LogLevel.Information))
+           {
+            _logger.LogInformation("Received health check request for service: {Service}", request.Service);
+           }
             var cancellationToken = context.CancellationToken;
             // If service is empty or null, check overall health
             if (string.IsNullOrEmpty(request.Service))
@@ -90,7 +92,10 @@ namespace cart.healthcheck
 
         public override async Task Watch(HealthCheckRequest request, IServerStreamWriter<HealthCheckResponse> responseStream, ServerCallContext context)
         {
-            Log.HealthWatchRequest(_logger, request.Service);
+            if (_logger.IsEnabled(LogLevel.Information))
+            {
+            _logger.LogInformation("Received health watch request for service: {Service}", request.Service);
+            }
             // Simple implementation to send current status once
             var response = await Check(request, context);
             await responseStream.WriteAsync(response);

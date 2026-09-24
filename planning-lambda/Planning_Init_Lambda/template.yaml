@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Planning_Init_Lambda - Entry point for AWS Lambda planning services.
+  Receives orders from K8s planning service and routes to handlers.
+
+Globals:
+  Function:
+    Timeout: 30
+    Tags:
+      splunkit_data_classification: public
+      splunkit_environment_type: non-prd
+    MemorySize: 256
+    Runtime: python3.13
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+        OTEL_SERVICE_NAME: Planning_Init_Lambda
+        # Default Resource attr for pre-handler / unknown-env records; per-record
+        # deployment.environment set by the handler wins after set_current_env().
+        OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=unknown-lambda"
+        # Set OTEL_EXPORTER_OTLP_ENDPOINT to send traces to your collector
+        # OTEL_EXPORTER_OTLP_ENDPOINT: http://your-collector:4317
+
+Parameters:
+  Stage:
+    Type: String
+    Default: planning
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+      - demo
+      - planning
+    Description: Deployment stage
+
+  OtelCollectorEndpoint:
+    Type: String
+    Default: ""
+    Description: OpenTelemetry collector endpoint (optional)
+
+Resources:
+  # API Gateway HTTP API
+  PlanningApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - traceparent
+          - tracestate
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+
+  # Main Lambda Function
+  PlanningInitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "splunk-astronomy-${Stage}-planning-init-lambda"
+      Description: Planning service entry point - processes orders from K8s
+      CodeUri: ../
+      Handler: Planning_Init_Lambda.lambda_function.lambda_handler
+      Environment:
+        Variables:
+          OTEL_EXPORTER_OTLP_ENDPOINT: !Ref OtelCollectorEndpoint
+          # Auto-wired to the Process function below so Init forwards each
+          # batch to Process via boto3 lambda.invoke (RequestResponse).
+          DOWNSTREAM_LAMBDA_ARN: !GetAtt PlanningProcessFunction.Arn
+          STAGE: !Ref Stage
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-0f67076d7425fd810
+        SubnetIds:
+          - subnet-02cd39d6beb29495e
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        # Required for Lambda in VPC
+        - AWSLambdaVPCAccessExecutionRole
+        # Allow invoking other Lambda functions
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: "*"
+      Events:
+        # Root path
+        RootPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PlanningApi
+            Path: /
+            Method: POST
+        # Orders endpoint
+        OrdersPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PlanningApi
+            Path: /orders
+            Method: POST
+        # Analytics endpoint
+        AnalyticsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PlanningApi
+            Path: /analytics
+            Method: POST
+        # Forecast endpoint
+        ForecastPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PlanningApi
+            Path: /forecast
+            Method: POST
+
+  # Downstream Lambda Function (invoked sync by PlanningInitFunction)
+  PlanningProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "splunk-astronomy-${Stage}-planning-process-lambda"
+      Description: Per-order processing - emits traces + metrics + logs via OTLP
+      CodeUri: ../
+      Handler: Planning_Process_Lambda.lambda_function.lambda_handler
+      Environment:
+        Variables:
+          OTEL_EXPORTER_OTLP_ENDPOINT: !Ref OtelCollectorEndpoint
+          STAGE: !Ref Stage
+          # Override the Globals.Function OTEL_SERVICE_NAME so Process
+          # logs/spans/metrics tag with the correct service name. Without
+          # this override, both Lambdas would inherit "Planning_Init_Lambda"
+          # from Globals and Splunk APM would conflate them.
+          OTEL_SERVICE_NAME: Planning_Process_Lambda
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-0f67076d7425fd810
+        SubnetIds:
+          - subnet-02cd39d6beb29495e
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+
+Outputs:
+  PlanningApiEndpoint:
+    Description: API Gateway endpoint URL for Planning_Init_Lambda
+    Value: !Sub "https://${PlanningApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+
+  PlanningInitFunctionArn:
+    Description: Planning_Init_Lambda Function ARN
+    Value: !GetAtt PlanningInitFunction.Arn
+
+  PlanningInitFunctionName:
+    Description: Planning_Init_Lambda Function Name
+    Value: !Ref PlanningInitFunction
+
+  PlanningProcessFunctionArn:
+    Description: Planning_Process_Lambda Function ARN
+    Value: !GetAtt PlanningProcessFunction.Arn
+
+  PlanningProcessFunctionName:
+    Description: Planning_Process_Lambda Function Name
+    Value: !Ref PlanningProcessFunction

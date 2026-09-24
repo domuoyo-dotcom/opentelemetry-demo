@@ -8,6 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ApiGateway from "@/gateways/Api.gateway";
 import { CartItem, OrderResult, PlaceOrderRequest } from "@/protos/demo";
 import { IProductCart } from "@/types/Cart";
+import { executeWithWorkflowSpan } from "@/utils/TelemetryUtils";
 
 interface IContext {
   cart: IProductCart;
@@ -42,26 +43,33 @@ const CartProvider = ({ children }: IProps) => {
     [queryClient],
   );
 
-  const { data: cart = { userId: "", items: [] } } = useQuery({
-    queryKey: ["cart", selectedCurrency],
-    queryFn: () => ApiGateway.getCart(selectedCurrency),
-  });
-  const addCartMutation = useMutation({
-    mutationFn: ApiGateway.addCartItem,
-    ...mutationOptions,
-  });
-  const emptyCartMutation = useMutation({
-    mutationFn: ApiGateway.emptyCart,
-    ...mutationOptions,
-  });
-  const placeOrderMutation = useMutation({
-    mutationFn: ApiGateway.placeOrder,
-    ...mutationOptions,
-  });
+  const { data: cart = { userId: "", items: [] } } = useQuery(
+    ["cart", selectedCurrency],
+    () => ApiGateway.getCart(selectedCurrency),
+  );
+  const addCartMutation = useMutation(ApiGateway.addCartItem, mutationOptions);
+  const emptyCartMutation = useMutation(ApiGateway.emptyCart, mutationOptions);
+  const placeOrderMutation = useMutation(
+    ApiGateway.placeOrder,
+    mutationOptions,
+  );
 
   const addItem = useCallback(
-    (item: CartItem) =>
-      addCartMutation.mutateAsync({ ...item, currencyCode: selectedCurrency }),
+    async (item: CartItem) => {
+      return executeWithWorkflowSpan(
+        'AddToCart',
+        {
+          'product.id': item.productId,
+          'product.quantity': item.quantity,
+        },
+        async () => {
+          return await addCartMutation.mutateAsync({
+            ...item,
+            currencyCode: selectedCurrency
+          });
+        }
+      );
+    },
     [addCartMutation, selectedCurrency],
   );
   const emptyCart = useCallback(
@@ -69,11 +77,38 @@ const CartProvider = ({ children }: IProps) => {
     [emptyCartMutation],
   );
   const placeOrder = useCallback(
-    (order: PlaceOrderRequest) =>
-      placeOrderMutation.mutateAsync({
-        ...order,
-        currencyCode: selectedCurrency,
-      }),
+    async (order: PlaceOrderRequest) => {
+      return executeWithWorkflowSpan(
+        'PlaceOrder',
+        {
+          'workflow.name': 'PlaceOrder',
+        },
+        async () => {
+          return await placeOrderMutation.mutateAsync({
+            ...order,
+            currencyCode: selectedCurrency,
+          });
+        },
+        // Add order result details to the span
+        (result: OrderResult, span) => {
+          span.setAttribute('order.id', result.orderId);
+          span.setAttribute('order.tracking_id', result.shippingTrackingId);
+          span.setAttribute('order.items_count', result.items.length);
+
+          if (result.shippingCost) {
+            span.setAttribute('order.shipping_cost', result.shippingCost.units || 0);
+            span.setAttribute('order.currency', result.shippingCost.currencyCode || 'USD');
+          }
+
+          console.log('✅ PlaceOrder completed:', {
+            orderId: result.orderId,
+            trackingId: result.shippingTrackingId,
+            itemsCount: result.items.length,
+            shippingCost: result.shippingCost
+          });
+        }
+      );
+    },
     [placeOrderMutation, selectedCurrency],
   );
 

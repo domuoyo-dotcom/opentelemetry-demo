@@ -8,7 +8,7 @@ import CurrencyProvider from '../providers/Currency.provider';
 import CartProvider from '../providers/Cart.provider';
 import { ThemeProvider } from 'styled-components';
 import Theme from '../styles/Theme';
-import FrontendTracer from '../utils/telemetry/FrontendTracer';
+//mport FrontendTracer from '../utils/telemetry/FrontendTracer';
 import SessionGateway from '../gateways/Session.gateway';
 import { OpenFeatureProvider, OpenFeature } from '@openfeature/react-sdk';
 import { FlagdWebProvider } from '@openfeature/flagd-web-provider';
@@ -20,12 +20,18 @@ declare global {
       NEXT_PUBLIC_OTEL_SERVICE_NAME?: string;
       NEXT_PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT?: string;
       IS_SYNTHETIC_REQUEST?: string;
+      SPLUNK_RUM_TOKEN?: string;
+      SPLUNK_APP_NAME?: string;
+      SPLUNK_ENV?: string;
+      SPLUNK_RUM_REALM?: string;
+      DEPLOYMENT_TYPE?: string;
     };
+    tracer?: any; // OpenTelemetry tracer for custom spans
   }
 }
 
 if (typeof window !== 'undefined') {
-  FrontendTracer();
+  //FrontendTracer();
   if (window.location) {
     const session = SessionGateway.getSession();
 

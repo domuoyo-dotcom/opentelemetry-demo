@@ -44,8 +44,8 @@ const CartDropdown = ({ productList, isOpen, onClose }: IProps) => {
           {productList.map(
             ({ quantity, product: { name, picture, id, priceUsd = { nanos: 0, currencyCode: 'USD', units: 0 } } }) => (
               <S.Item key={id} data-cy={CypressFields.CartDropdownItem}>
-                {picture && <S.ItemImage src={'/images/products/' + picture} alt={name} />}
-                <S.ItemDetails $fullWidth={!picture}>
+                <S.ItemImage src={"/images/products/" + picture} alt={name} />
+                <S.ItemDetails>
                   <S.ItemName>{name}</S.ItemName>
                   <ProductPrice price={priceUsd} />
                   <S.ItemQuantity>Quantity: {quantity}</S.ItemQuantity>
@@ -56,7 +56,7 @@ const CartDropdown = ({ productList, isOpen, onClose }: IProps) => {
         </S.ItemList>
       </S.ContentWrapper>
       <Link href="/cart">
-        <S.CartButton data-cy={CypressFields.CartGoToShopping}>Go to Shopping Cart</S.CartButton>
+        <S.CartButton id="btn-go-to-shopping-cart" data-cy={CypressFields.CartGoToShopping}>Go to Shopping Cart</S.CartButton>
       </Link>
     </S.CartDropdown>
   ) : null;

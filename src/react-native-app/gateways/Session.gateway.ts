@@ -30,8 +30,8 @@ const SessionGateway = () => ({
       sessionString || JSON.stringify(defaultSession),
     ) as ISession;
   },
-  async setSessionValue<K extends keyof ISession>(key: K, value: ISession[K]) {
-    const session = await this.getSession();
+  setSessionValue<K extends keyof ISession>(key: K, value: ISession[K]) {
+    const session = this.getSession();
 
     return AsyncStorage.setItem(
       sessionKey,

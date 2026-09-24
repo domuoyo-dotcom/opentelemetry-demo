@@ -1,0 +1,590 @@
+# Kubernetes manifest for astronomy-loadgen
+# Includes scriptfile ConfigMap used by the deployment
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scriptfile
+data:
+  local-file: |
+    /* eslint-disable no-console */
+    const { Console } = require('console');
+    const puppeteer = require('puppeteer');
+    const customUserAgent = 'Mozilla/5.0 (X11; Linux x86_64; Splunk RUM_LoadGen) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
+
+    // Debug logging flag (set via DEBUG_LOGGING env var)
+    const debugEnabled = process.env.DEBUG_LOGGING === 'true';
+    if (debugEnabled) console.log('DEBUG: Using User Agent:', customUserAgent);
+
+    // Global browser instance for reuse across cycles
+    let globalBrowser = null;
+
+
+    async function launchBrowser() {
+      console.log('🔹 Starting headless browser...');
+      const browser = await puppeteer.launch({
+        headless: true,
+        defaultViewport: null,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-gpu',
+          '--disable-dev-shm-usage',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+          '--max-old-space-size=256',
+          '--disable-extensions',
+          '--disable-plugins',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--memory-pressure-off',
+          '--aggressive-cache-discard',
+          // Do NOT add '--ignore-certificate-errors' or `acceptInsecureCerts: true`.
+          // On plain-HTTP deploys they break Chromium fetch/hydration and every
+          // cycle fails at waitForSelector. See CERT_FLAG_NOTE.md.
+          '--allow-insecure-localhost',
+          `--user-agent=${customUserAgent}`
+        ]
+      });
+      console.log('✅ Browser started.');
+      return browser;
+    }
+
+    async function ensureBrowser() {
+      if (!globalBrowser || !globalBrowser.isConnected()) {
+        console.log('🔄 Launching new global browser instance...');
+        globalBrowser = await launchBrowser();
+      }
+      return globalBrowser;
+    }
+
+    function buildBaseUrl() {
+      const raw = (process.env.RUM_FRONTEND_IP || '').trim();
+
+      // If unset (secret absent), fall back to the in-cluster ingress.
+      if (!raw) return 'http://frontend-proxy:8080/';
+
+      // If it already starts with http:// or https://, keep it exactly as-is
+      if (/^https?:\/\//i.test(raw)) {
+        return raw.replace(/\/+$/, '') + '/';
+      }
+
+      // Otherwise, prepend https://
+      return `https://${raw.replace(/\/+$/, '')}/`;
+    }
+
+    // --- flagd feature flags via OFREP --------------------------------------
+    // flagd serves the OpenFeature Remote Evaluation Protocol over HTTP on
+    // port 8016 (see src/flagd/flagd-k8s.yaml). Node 24 has global fetch, so
+    // no OpenFeature SDK / gRPC deps are needed — one POST per flag. flagd
+    // returns the live value, so flipping a flag in flagd-ui is reflected on
+    // the next cycle with no loadgen restart. Disable with
+    // FLAGD_OFREP_ENABLED=false; override endpoint with FLAGD_OFREP_URL.
+    const FLAGD_OFREP_ENABLED = (process.env.FLAGD_OFREP_ENABLED || 'true').toLowerCase() !== 'false';
+    const FLAGD_OFREP_URL = (process.env.FLAGD_OFREP_URL || 'http://flagd:8016').replace(/\/+$/, '');
+
+    // --- Panic path (angry rage-click) tuning -------------------------------
+    // When the rumLoadGenPanicMode flag is on, every Nth load cycle takes a
+    // DIFFERENT path: instead of placing an order, the browser rapidly clicks
+    // the intentionally-inert "Show All Reviews" button to mimic a frustrated
+    // user rage-clicking, then clicks away — driving RUM frustration / rage-
+    // click detection. Mirrors the Splunk Synthetics rage-click transaction.
+    // N is a fixed constant here for now; the intent is for it to come from the
+    // same flagd entry (rumLoadGenPanicMode variant value) in a later step.
+    const PANIC_EVERY_N_LOOPS = 10;      // take the angry path once every N cycles
+    const PANIC_RAGE_CLICKS = 6;         // clicks per rage burst (synthetics: 1 + 5 repeats)
+    const PANIC_RAGE_INTERVAL_MS = 80;   // gap between rage clicks (synthetics: 80ms)
+    let panicLoopCounter = 0;            // increments each cycle; angry path on multiples of N
+
+    /**
+     * Evaluate a single flag via OFREP. Returns `def` on any failure (flagd
+     * unreachable, non-2xx, timeout, missing flag) so flag lookups never block
+     * or crash a load cycle.
+     */
+    async function getFlag(key, def) {
+      if (!FLAGD_OFREP_ENABLED) return def;
+      try {
+        const resp = await fetch(`${FLAGD_OFREP_URL}/ofrep/v1/evaluate/flags/${key}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ context: { targetingKey: 'rumloadgen' } }),
+          signal: AbortSignal.timeout(2000)
+        });
+        if (!resp.ok) {
+          if (debugEnabled) console.log(`[DEBUG] OFREP ${key}: HTTP ${resp.status}`);
+          return def;
+        }
+        const body = await resp.json();
+        return body.value !== undefined ? body.value : def;
+      } catch (e) {
+        if (debugEnabled) console.log(`[DEBUG] OFREP ${key} lookup failed: ${e.message}`);
+        return def;
+      }
+    }
+
+    /**
+     * Angry rage-click path. Rapidly clicks the intentionally-inert "Show All
+     * Reviews" button (id btn-show-all-reviews, data-cy ShowAllReviews) to
+     * simulate a frustrated user, then clicks away to the recommendations
+     * section — the same sequence as the Splunk Synthetics rage-click test.
+     * Best-effort: missing elements are logged and skipped, never thrown.
+     */
+    async function rageClickReviews(page) {
+      const reviewBtn = "[data-cy='ShowAllReviews']";
+      try {
+        await page.waitForSelector(reviewBtn, { timeout: 8000, visible: true });
+      } catch {
+        console.log('⚠️ Panic path: "Show All Reviews" button not found, skipping rage clicks');
+        return;
+      }
+      console.log(`🚨 rum-loadgen Panic mode: rage-clicking "Show All Reviews" ${PANIC_RAGE_CLICKS}x @ ${PANIC_RAGE_INTERVAL_MS}ms`);
+      for (let i = 0; i < PANIC_RAGE_CLICKS; i++) {
+        await page.click(reviewBtn).catch(() => {});
+        await delay(PANIC_RAGE_INTERVAL_MS);
+      }
+      // Click away to the recommendations section, like the synthetics test.
+      const away = "[data-cy='recommendation-list']";
+      await page.waitForSelector(away, { timeout: 5000, visible: true })
+        .then(() => page.click(away))
+        .then(() => console.log('👋 Panic path: clicked away to recommendations'))
+        .catch(() => console.log('⚠️ Panic path: recommendations click-away skipped'));
+      await delay(1500); // let the RUM batcher flush the rage-click beacon
+    }
+
+    function getProductIds() {
+      const envProductIds = (process.env.PRODUCT_IDS || '').trim();
+      if (envProductIds) {
+        return envProductIds.split(',').map(id => id.trim()).filter(id => id);
+      }
+      // Hardcoded product IDs if env variable is not set or empty
+      return [
+        'OLJCESPC7Z', // National Park Foundation Explorascope
+        '66VCHSJNUP', // Starsense Explorer Refractor Telescope
+        '1YMWWN1N4O', // Eclipsmart Travel Refractor Telescope
+        'L9ECAV7KIM', // Lens Cleaning Kit
+        '2ZYFJ3GM2N', // Roof Binoculars
+        '0PUK6V6EV0', // Solar System Color Imager
+        'LS4PSXUNUM', // Red Flashlight
+        '9SIQT8TOJO', // Optical Tube Assembly
+        '6E92ZMYYFZ', // Solar Filter
+        'HQTGWGPNH4'  // The Comet Book
+      ];
+    }
+
+    function getRandomProducts() {
+      const allProducts = getProductIds();
+      const numProducts = Math.floor(Math.random() * 3) + 1; // Random number between 1 and 3
+      const shuffled = allProducts.sort(() => Math.random() - 0.5);
+      return shuffled.slice(0, numProducts);
+    }
+
+    // Currency rotation for throttle-demo: a fraction of orders is placed in
+    // a non-USD currency to drive cross-border-compliance code paths in the
+    // order-validation (heavier compliance work → CPU-throttle in APM).
+    const NON_USD_PROBABILITY = parseFloat(process.env.NON_USD_PROBABILITY || '0');
+    const NON_USD_CURRENCIES = (process.env.NON_USD_CURRENCIES || 'EUR,GBP,JPY,CAD,CHF')
+      .split(',').map(c => c.trim()).filter(c => c);
+
+    function pickCurrency() {
+      if (NON_USD_PROBABILITY > 0 && Math.random() < NON_USD_PROBABILITY && NON_USD_CURRENCIES.length) {
+        return NON_USD_CURRENCIES[Math.floor(Math.random() * NON_USD_CURRENCIES.length)];
+      }
+      return 'USD';
+    }
+
+    /** Switch the frontend currency dropdown. No-op for USD (page default). */
+    async function setCurrency(page, code) {
+      if (!code || code === 'USD') return;
+      try {
+        await page.waitForSelector('#currency-select', { timeout: 5000 });
+        await page.select('#currency-select', code);
+        console.log(`💱 Currency switched to ${code}`);
+        await delay(500);
+      } catch (e) {
+        console.log(`⚠️ Currency switch to ${code} failed: ${e.message}`);
+      }
+    }
+
+    // Throttle quick prompts — parsed from env, default 5 min
+    const QUICK_PROMPT_INTERVAL_MS = parseInt(process.env.QUICK_PROMPT_INTERVAL_MS || '300000', 10);
+    let lastQuickPromptTime = 0;
+
+    // Shipping API — random interval between 34s and 1m45s
+    const SHIPPING_MIN_MS = parseInt(process.env.SHIPPING_MIN_MS || '34000', 10);
+    const SHIPPING_MAX_MS = parseInt(process.env.SHIPPING_MAX_MS || '105000', 10);
+    let nextShippingTime = 0;
+    const SHIPPING_API_ENABLED = (process.env.SHIPPING_API || '').toLowerCase() === 'true';
+
+    function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
+
+    /** Generate a random shipping tracking number */
+    function randomTrackingNumber() {
+      const num = Math.floor(Math.random() * 99999) + 10000;
+      return `SHIP-${num}`;
+    }
+
+    /** Schedule next shipping call at a random interval */
+    function scheduleNextShipping() {
+      const interval = SHIPPING_MIN_MS + Math.floor(Math.random() * (SHIPPING_MAX_MS - SHIPPING_MIN_MS));
+      nextShippingTime = Date.now() + interval;
+      if (debugEnabled) console.log(`[DEBUG] Next shipping call in ${Math.round(interval/1000)}s`);
+    }
+
+    /** Fetch shipping info via the frontend-proxy /shipping/ route */
+    async function fetchShippingInfo(page) {
+      if (!SHIPPING_API_ENABLED) return;
+      if (Date.now() < nextShippingTime) return;
+      scheduleNextShipping();
+
+      const tracking = randomTrackingNumber();
+      const base = buildBaseUrl();
+      const url = `${base}shipping/?tracking=${tracking}`;
+      console.log(`📦 Fetching shipping info for ${tracking}...`);
+      try {
+        const result = await page.evaluate(async (fetchUrl) => {
+          const resp = await fetch(fetchUrl);
+          return { status: resp.status, body: await resp.text() };
+        }, url);
+        console.log(`📦 Shipping info: HTTP ${result.status}`);
+        if (debugEnabled) console.log(`[DEBUG] Shipping response: ${result.body}`);
+      } catch (e) {
+        console.log(`⚠️ Shipping info fetch failed: ${e.message}`);
+      }
+    }
+
+    /** Wait until innerText of the page contains a substring */
+    async function waitForText(page, text, timeoutMs = 30000, pollMs = 200) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const found = await page.evaluate(t =>
+          document && document.body && document.body.innerText.includes(t),
+          text
+        );
+        if (found) return true;
+        await delay(pollMs);
+      }
+      throw new Error(`Timed out waiting for text: "${text}"`);
+    }
+
+    async function runOnce() {
+      const browser = await ensureBrowser();
+      let page;
+      let ctx;
+      try {
+        // Fresh browser context per cycle so localStorage / cookies / session
+        // ID reset between cycles. Otherwise every cycle reuses the same RUM
+        // session ID and the funnel sees a single user looping forever.
+        ctx = await browser.createBrowserContext();
+        page = await ctx.newPage();
+        page.setDefaultNavigationTimeout(45000);
+        page.setDefaultTimeout && page.setDefaultTimeout(30000);
+
+        // Log all responses for debugging (when DEBUG_LOGGING=true)
+        if (debugEnabled) {
+          page.on('response', response => {
+            const url = response.url();
+            if (url.includes('api')) {
+              console.log(`[DEBUG] API Response: ${url} (${response.status()})`);
+            }
+          });
+        }
+
+        const base = buildBaseUrl();
+
+        // Feature-flag check each cycle, before product selection, so a
+        // flagd-ui toggle takes effect on the very next loop. When
+        // rumLoadGenPanicMode is on, every PANIC_EVERY_N_LOOPS-th cycle takes
+        // the angry rage-click path instead of placing an order.
+        panicLoopCounter += 1;
+        const panicMode = await getFlag('rumLoadGenPanicMode', false);
+        const angry = panicMode && (panicLoopCounter % PANIC_EVERY_N_LOOPS === 0);
+        if (angry) {
+          console.log(`🚨 rum-loadgen Panic mode: ANGRY rage-click path this cycle (loop #${panicLoopCounter}, every ${PANIC_EVERY_N_LOOPS})`);
+        } else if (panicMode) {
+          console.log(`rum-loadgen Panic mode on; normal path (loop #${panicLoopCounter}, angry every ${PANIC_EVERY_N_LOOPS})`);
+        }
+
+        const productsToOrder = getRandomProducts();
+        const cycleCurrency = pickCurrency();
+        console.log(`🛒 Ordering ${productsToOrder.length} product(s) in ${cycleCurrency}: ${productsToOrder.join(', ')}`);
+
+        // Visit homepage first so the user enters the sequential RUM funnel
+        // at step 1. Without this the loadgen lands on /product/<id> and the
+        // funnel records 0 conversions because step 1 is never satisfied.
+        const homeUrl = base.replace(/\/+$/, '/');
+        console.log(`🏠 Visiting homepage ${homeUrl}`);
+        await page.goto(homeUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await delay(1500);
+
+        // Switch currency before product browsing so prices + cart totals
+        // already reflect the target currency.
+        await setCurrency(page, cycleCurrency);
+
+        // Loop through each product and add to cart
+        for (const productId of productsToOrder) {
+          const url = new URL(`product/${productId}`, base).toString();
+          console.log(`🌐 Navigating to ${url}`);
+
+          // Set up /api/data response listener BEFORE navigation
+          const apiDataPromise = page.waitForResponse(
+            response => {
+              const url = response.url();
+              const status = response.status();
+              const matches = url.includes('/api/data') && (status === 200 || status === 304);
+              if (matches) {
+                console.log(`✅ /api/data response received: ${status}`);
+              }
+              return matches;
+            },
+            { timeout: 15000 }
+          );
+
+          // Navigate to page
+          await page.goto(url, {
+            waitUntil: 'networkidle2',  // Wait until no more than 2 connections for 500ms
+            timeout: 60000               // 60 second timeout for page load
+          });
+
+          // Now wait for /api/data to complete (may have already completed during goto)
+          console.log('⏳ Ensuring ad service (/api/data) completed...');
+          await apiDataPromise.catch(() => {
+            console.log('⚠️ /api/data did not complete in 15s, continuing anyway...');
+          });
+
+          // Small delay to ensure any follow-up requests finish
+          await delay(500);
+          console.log('✅ Page fully loaded with all API calls complete');
+
+          // Quick prompts - throttled to once every 5 minutes
+          const now = Date.now();
+          if (now - lastQuickPromptTime >= QUICK_PROMPT_INTERVAL_MS) {
+          lastQuickPromptTime = now;
+
+          const quickPrompts = [
+            {
+              label: 'Can you summarize the product reviews?',
+              dataCy: 'QuickPromptSummarize',
+              ariaSelector: '::-p-aria(Can you summarize the product reviews?)',
+              textSelector: '::-p-text(Can you summarize)',
+              offset: { x: 129, y: 15 },
+            },
+            {
+              label: 'Were there any negative reviews?',
+              dataCy: 'QuickPromptNegative',
+              ariaSelector: '::-p-aria(Were there any negative reviews?)',
+              textSelector: '::-p-text(Were there any)',
+              offset: { x: 171.6640625, y: 25 },
+            },
+            {
+              label: 'What age(s) is this recommended for?',
+              dataCy: 'QuickPromptAges',
+              ariaSelector: '::-p-aria(What age\\(s\\) is this recommended for?)',
+              textSelector: '::-p-text(What age\\(s\\) is)',
+              offset: { x: 148.0390625, y: 19 },
+            },
+          ];
+
+          const prompt = quickPrompts[Math.floor(Math.random() * quickPrompts.length)];
+          console.log(`🖱️ Clicking quick prompt: "${prompt.label}"`);
+
+          {
+              const targetPage = page;
+              const timeout = 5000;
+              await puppeteer.Locator.race([
+                  targetPage.locator(prompt.ariaSelector),
+                  targetPage.locator(`[data-cy='${prompt.dataCy}']`),
+                  targetPage.locator(`::-p-xpath(//*[@data-cy=\\"${prompt.dataCy}\\"])`),
+                  targetPage.locator(`:scope >>> [data-cy='${prompt.dataCy}']`),
+                  targetPage.locator(prompt.textSelector)
+              ])
+                  .setTimeout(timeout)
+                  .click({ offset: prompt.offset });
+              console.log('⏳ Waiting for AI response...');
+              await delay(500); // Let request start
+              await page.waitForSelector("[data-cy='AIAnswer']", { timeout: 15000, visible: true }).catch(() => {
+                console.log('⚠️ AI response timeout, continuing...');
+              });
+              await delay(1500); // Allow response to fully render
+          }
+
+          } else {
+            console.log('⏭️ Skipping quick prompts (next run in ' + Math.round((QUICK_PROMPT_INTERVAL_MS - (now - lastQuickPromptTime)) / 1000) + 's)');
+          }
+
+          // Angry path: rage-click the reviews button on this product page and
+          // leave — no add-to-cart, no remaining products, no order this cycle.
+          if (angry) {
+            await rageClickReviews(page);
+            break;
+          }
+
+          const addSel = "[data-cy='product-add-to-cart']";
+          await page.waitForSelector(addSel);
+          console.log(`🖱️ Clicking "Add To Cart" for product ${productId}`);
+          await page.click(addSel);
+        }
+
+        // Angry cycles already rage-clicked and clicked away above — skip
+        // ordering entirely (the frustrated user never checks out).
+        if (angry) {
+          await fetchShippingInfo(page);
+          return;
+        }
+
+        // Place order after all products are added to cart
+        const placeSel = "[data-cy='checkout-place-order']";
+        await page.waitForSelector(placeSel);
+        console.log('🖱️ Clicking "Place Order"');
+        await page.click(placeSel);
+
+        // Wait for either success message or error modal
+        console.log('⏳ Waiting for order result...');
+        const orderResult = await Promise.race([
+          waitForText(page, 'Your order is complete!').then(() => 'success'),
+          page.waitForSelector('#modal-close-btn', { timeout: 30000, visible: true }).then(() => 'error-modal')
+        ]);
+
+        if (orderResult === 'success') {
+          console.log('🎉 Order completed successfully!');
+          // Confirmation page useEffect fires the `order.confirmed` RUM span
+          // asynchronously. Wait so the RUM batcher can flush the beacon
+          // before the page / context is torn down.
+          await delay(5000);
+        } else if (orderResult === 'error-modal') {
+          console.log('⚠️ Error modal detected - closing it to continue...');
+          await page.click('#modal-close-btn');
+          await delay(500);
+          console.log('✅ Error modal closed.');
+        }
+
+        // Periodic shipping info fetch (every 2 minutes, gated by SHIPPING_API)
+        await fetchShippingInfo(page);
+      } finally {
+        console.log('🧹 Cleaning up page resources...');
+        try {
+          if (page) {
+            page.removeAllListeners();
+            await page.close({ runBeforeUnload: true }).catch(()=>{});
+          }
+          if (ctx) {
+            await ctx.close().catch(()=>{});
+          }
+        } catch (e) {
+          console.error('⚠️ Error closing page:', e.message);
+        }
+        console.log('✅ Page + context closed cleanly. Browser will be reused for next cycle.');
+      }
+    }
+
+    (async function mainLoop() {
+      const cycleDelayMs = parseInt(process.env.CYCLE_DELAY_MS || '5000', 10);
+      console.log(`⚙️ Cycle delay: ${cycleDelayMs}ms`);
+
+      let cycle = 1;
+      while (true) {
+        console.log(`=== Starting load generation cycle #${cycle} ===`);
+        try {
+          await runOnce();
+          console.log(`✅ Cycle #${cycle} finished OK`);
+        } catch (e) {
+          console.error(`❌ Cycle #${cycle} failed:`, e && e.stack ? e.stack : e);
+        }
+        cycle += 1;
+        await delay(cycleDelayMs);
+      }
+    })();
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: astronomy-loadgen-deployment
+  labels:
+    app: astronomy-loadgen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: astronomy-loadgen
+  template:
+    metadata:
+      labels:
+        app: astronomy-loadgen
+    spec:
+      initContainers:
+      - name: wait-for-frontend
+        image: curlimages/curl:8.1.2
+        env:
+        # Same source-of-truth as the main container: prefer public URL
+        # from workshop-secret; fall back to in-cluster ingress when absent.
+        - name: RUM_FRONTEND_IP
+          valueFrom:
+            secretKeyRef:
+              name: workshop-secret
+              key: url
+              optional: true
+        command: ['sh', '-c']
+        args:
+        - |
+          TARGET="${RUM_FRONTEND_IP:-http://frontend-proxy:8080}"
+          echo "Waiting for ${TARGET} to be ready..."
+          until curl -f -k --connect-timeout 5 --max-time 10 "${TARGET}"; do
+            echo "Frontend not ready, waiting 10 seconds..."
+            sleep 10
+          done
+          echo "Frontend is ready, starting loadgen..."
+        resources:
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+      containers:
+      - name: astronomy-loadgen
+        image: ghcr.io/splunk/online-boutique/rumloadgen:5.6
+        imagePullPolicy: Always
+        env:
+        # RUM funnels typically filter on the public ingress URL. Sourced
+        # from workshop-secret.url when present so the loadgen browser
+        # navigates to the same origin as real users; when the secret is
+        # absent the container falls back to http://frontend-proxy:8080/
+        # (see buildBaseUrl in the scriptfile above).
+        - name: RUM_FRONTEND_IP
+          valueFrom:
+            secretKeyRef:
+              name: workshop-secret
+              key: url
+              optional: true
+        - name: CYCLE_DELAY_MS
+          value: "1000"
+        - name: DEBUG_LOGGING
+          value: ""  # Set to "true" to enable debug logging
+        - name: QUICK_PROMPT_INTERVAL_MS
+          value: "300000"  # How often AI quick prompts run (ms). Default 300000 (5min). Set "0" for every cycle.
+        - name: SHIPPING_API
+          valueFrom:
+            secretKeyRef:
+              name: workshop-secret
+              key: shipping_api
+              optional: true
+        # Throttle-demo: fraction of orders placed in a non-USD currency to
+        # drive the cross-border path in order-validation. Default 0
+        # (USD-only). Tune up to ~0.10 for visible non-USD signal in APM.
+        - name: NON_USD_PROBABILITY
+          value: "0.10"
+        - name: NON_USD_CURRENCIES
+          value: "EUR,GBP,JPY,CAD,CHF"
+        resources:
+          requests:
+            memory: "768Mi"
+            cpu: "500m"
+          limits:
+            memory: "1536Mi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: puppeteer
+          subPath: local-file
+          mountPath: /puppeteer/touchwebsite.js
+      volumes:
+      - name: puppeteer
+        configMap:
+          name: scriptfile

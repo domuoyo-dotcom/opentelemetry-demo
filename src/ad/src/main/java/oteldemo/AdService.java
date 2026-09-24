@@ -25,8 +25,6 @@ import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.instrumentation.annotations.SpanAttribute;
 import io.opentelemetry.instrumentation.annotations.WithSpan;
-import io.prometheus.metrics.core.metrics.Counter;
-import io.prometheus.metrics.exporter.httpserver.HTTPServer;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -48,6 +46,7 @@ import dev.openfeature.sdk.EvaluationContext;
 import dev.openfeature.sdk.MutableContext;
 import dev.openfeature.sdk.OpenFeatureAPI;
 import java.util.UUID;
+import org.apache.commons.codec.binary.Base64;
 
 
 public final class AdService {
@@ -59,25 +58,6 @@ public final class AdService {
 
   private Server server;
   private HealthStatusManager healthMgr;
-  private HTTPServer prometheusServer;
-
-  // DEMO: this counter and its `/metrics` HTTP exporter use the Prometheus
-  // Java client library rather than the OpenTelemetry SDK. It is here to
-  // illustrate how non-OTel custom metrics (e.g. existing Prometheus
-  // instrumentation that an organization already owns) can be ingested into
-  // an OpenTelemetry pipeline via the Collector's `prometheus` receiver --
-  // a common bridging pattern during OTel adoption.
-  //
-  // Recommendation: this is a *transitional* pattern. New custom metrics
-  // should be created directly with the OpenTelemetry SDK (see the
-  // `adRequestsCounter` below), and existing Prometheus-client metrics
-  // should be migrated over time. See `src/ad/README.md` for details.
-  private static final Counter adsServedCounter =
-      Counter.builder()
-          .name("demo_ad_served_total")
-          .help("Total number of ads served, labeled by category")
-          .labelNames("category")
-          .register();
 
   private static final AdService service = new AdService();
   private static final Tracer tracer = GlobalOpenTelemetry.getTracer("ad");
@@ -85,14 +65,14 @@ public final class AdService {
 
   private static final LongCounter adRequestsCounter =
       meter
-          .counterBuilder("demo.ad.requests")
+          .counterBuilder("app.ads.ad_requests")
           .setDescription("Counts ad requests by request and response type")
           .build();
 
   private static final AttributeKey<String> adRequestTypeKey =
-      AttributeKey.stringKey("demo.ad.request_type");
+      AttributeKey.stringKey("app.ads.ad_request_type");
   private static final AttributeKey<String> adResponseTypeKey =
-      AttributeKey.stringKey("demo.ad.response_type");
+      AttributeKey.stringKey("app.ads.ad_response_type");
 
   private void start() throws IOException {
     int port =
@@ -102,11 +82,6 @@ public final class AdService {
                     () ->
                         new IllegalStateException(
                             "environment vars: AD_PORT must not be null")));
-    int prometheusPort =
-        Integer.parseInt(Optional.ofNullable(System.getenv("AD_PROMETHEUS_PORT")).orElse("9465"));
-    prometheusServer = HTTPServer.builder().port(prometheusPort).buildAndStart();
-    logger.info(
-        "Prometheus metrics endpoint started, listening on " + prometheusServer.getPort() + "/metrics");
     healthMgr = new HealthStatusManager();
 
     // Create a flagd instance with OpenTelemetry
@@ -143,9 +118,6 @@ public final class AdService {
     if (server != null) {
       healthMgr.clearStatus("");
       server.shutdown();
-    }
-    if (prometheusServer != null) {
-      prometheusServer.stop();
     }
   }
 
@@ -193,10 +165,6 @@ public final class AdService {
           span.setAttribute("session.id", sessionId);
           evaluationContext.setTargetingKey(sessionId);
           evaluationContext.add("session", sessionId);
-          final String enduserId = baggage.getEntryValue("enduser.id");
-          if (enduserId != null) {
-            span.setAttribute("enduser.id", enduserId);
-          }
         } else {
           logger.info("no baggage found in context");
         }
@@ -204,8 +172,8 @@ public final class AdService {
         CPULoad cpuload = CPULoad.getInstance();
         cpuload.execute(ffClient.getBooleanValue(AD_HIGH_CPU_FEATURE_FLAG, false, evaluationContext));
 
-        span.setAttribute("demo.ad.context_keys", req.getContextKeysList().toString());
-        span.setAttribute("demo.ad.context_keys.count", req.getContextKeysCount());
+        span.setAttribute("app.ads.contextKeys", req.getContextKeysList().toString());
+        span.setAttribute("app.ads.contextKeys.count", req.getContextKeysCount());
         if (req.getContextKeysCount() > 0) {
           logger.info("Targeted ad request received for " + req.getContextKeysList());
           for (int i = 0; i < req.getContextKeysCount(); i++) {
@@ -225,9 +193,9 @@ public final class AdService {
           allAds = service.getRandomAds();
           adResponseType = AdResponseType.RANDOM;
         }
-        span.setAttribute("demo.ad.count", allAds.size());
-        span.setAttribute("demo.ad.request_type", adRequestType.name());
-        span.setAttribute("demo.ad.response_type", adResponseType.name());
+        span.setAttribute("app.ads.count", allAds.size());
+        span.setAttribute("app.ads.ad_request_type", adRequestType.name());
+        span.setAttribute("app.ads.ad_response_type", adResponseType.name());
 
         adRequestsCounter.add(
             1,
@@ -260,12 +228,57 @@ public final class AdService {
 
   private static final ImmutableListMultimap<String, Ad> adsMap = createAdsMap();
 
+  @WithSpan("photoLicenceCheck")
+  private void photoLicenceCheck(@SpanAttribute("app.ads.product") String productId) {
+    Span span = Span.current();
+    span.setAttribute("app.ads.licence_check", true);
+
+    // NOTE: Uses commons-codec 1.6 which has CVE-2012-5783 (medium severity).
+    // This is intentionally vulnerable for security testing but NOT exploitable from
+    // external inputs as it only encodes internal product IDs (hardcoded in adsMap).
+    // No user-supplied data flows through this function.
+    byte[] encodedBytes = Base64.encodeBase64(productId.getBytes());
+    String encodedProductId = new String(encodedBytes);
+    span.setAttribute("app.ads.product.encoded", encodedProductId);
+
+    logger.info("Performing photo licence check for product: " + productId + " (encoded: " + encodedProductId + ")");
+
+    // CPU-intensive loop for approximately 0.45 seconds
+    long startTime = System.nanoTime();
+    long targetDuration = 450_000_000L; // 0.45 seconds in nanoseconds
+    double result = 0.0;
+
+    while ((System.nanoTime() - startTime) < targetDuration) {
+      // Perform CPU-intensive mathematical operations
+      for (int i = 0; i < 10000; i++) {
+        result += Math.sqrt(i) * Math.sin(i) * Math.cos(i);
+        result = result % 1000000; // Prevent overflow
+      }
+    }
+
+    long actualDuration = (System.nanoTime() - startTime) / 1_000_000; // Convert to ms
+    span.setAttribute("app.ads.licence_check.duration_ms", actualDuration);
+    logger.info("Photo licence check completed for product: " + productId + " in " + actualDuration + "ms");
+  }
+
   @WithSpan("getAdsByCategory")
-  private Collection<Ad> getAdsByCategory(@SpanAttribute("demo.ad.category") String category) {
+  private Collection<Ad> getAdsByCategory(@SpanAttribute("app.ads.category") String category) {
     Collection<Ad> ads = adsMap.get(category);
-    Span.current().setAttribute("demo.ad.count", ads.size());
-    adsServedCounter.labelValues(category).inc(ads.size());
+    Span.current().setAttribute("app.ads.count", ads.size());
+
+    // Perform photo licence check for each ad (all ads have product images)
+    for (Ad ad : ads) {
+      String productId = extractProductId(ad.getRedirectUrl());
+      photoLicenceCheck(productId);
+    }
+
     return ads;
+  }
+
+  private String extractProductId(String redirectUrl) {
+    // Extract product ID from URL like "/product/2ZYFJ3GM2N"
+    String[] parts = redirectUrl.split("/");
+    return parts.length > 2 ? parts[2] : "unknown";
   }
 
   private static final Random random = new Random();
@@ -282,10 +295,14 @@ public final class AdService {
 
       Collection<Ad> allAds = adsMap.values();
       for (int i = 0; i < MAX_ADS_TO_SERVE; i++) {
-        ads.add(Iterables.get(allAds, random.nextInt(allAds.size())));
+        Ad ad = Iterables.get(allAds, random.nextInt(allAds.size()));
+        ads.add(ad);
+
+        // Perform photo licence check for each randomly selected ad
+        String productId = extractProductId(ad.getRedirectUrl());
+        photoLicenceCheck(productId);
       }
-      span.setAttribute("demo.ad.count", ads.size());
-      adsServedCounter.labelValues("random").inc(ads.size());
+      span.setAttribute("app.ads.count", ads.size());
 
     } finally {
       span.end();

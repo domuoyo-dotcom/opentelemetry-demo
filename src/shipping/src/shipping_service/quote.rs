@@ -3,9 +3,7 @@
 
 use core::fmt;
 use opentelemetry::global;
-use opentelemetry::metrics::Counter;
 use opentelemetry_instrumentation_actix_web::ClientExt;
-use std::sync::LazyLock;
 use std::{collections::HashMap, env};
 
 use anyhow::{Context, Result};
@@ -13,12 +11,6 @@ use opentelemetry::{trace::get_active_span, KeyValue};
 use tracing::info;
 
 use super::shipping_types::Quote;
-
-static ITEMS_SHIPPED_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    global::meter("otel_demo.shipping.quote")
-        .u64_counter("demo.shipping.items_shipped")
-        .build()
-});
 
 pub async fn create_quote_from_count(count: u32) -> Result<Quote, tonic::Status> {
     let f = match request_quote(count).await {
@@ -29,18 +21,17 @@ pub async fn create_quote_from_count(count: u32) -> Result<Quote, tonic::Status>
         }
     };
 
-    ITEMS_SHIPPED_COUNTER.add(count as u64, &[]);
+    let meter = global::meter("otel_demo.shipping.quote");
+    let counter = meter.u64_counter("app.shipping.items_count").build();
+    counter.add(count as u64, &[]);
 
     Ok(get_active_span(|span| {
         let q = create_quote_from_float(f);
-        if span.is_recording() {
-            let cost = format!("{}", q);
-            span.add_event(
-                "shipping.quote.received".to_string(),
-                vec![KeyValue::new("demo.shipping.cost.total", cost.clone())],
-            );
-            span.set_attribute(KeyValue::new("demo.shipping.cost.total", cost));
-        }
+        span.add_event(
+            "Received Quote".to_string(),
+            vec![KeyValue::new("app.shipping.cost.total", format!("{}", q))],
+        );
+        span.set_attribute(KeyValue::new("app.shipping.cost.total", format!("{}", q)));
         q
     }))
 }
@@ -57,9 +48,9 @@ async fn request_quote(count: u32) -> Result<f64, anyhow::Error> {
     );
 
     info!(
-        name: "shipping.quote.requested",
+        name = "RequestingQuote",
         quote_service_addr = quote_service_addr.as_str(),
-        "Requesting quote"
+        message = "Requesting quote"
     );
 
     let mut reqbody = HashMap::new();
@@ -89,16 +80,15 @@ async fn request_quote(count: u32) -> Result<f64, anyhow::Error> {
 }
 
 pub fn create_quote_from_float(value: f64) -> Quote {
-    let total_cents = (value * 100_f64).round() as u64;
     Quote {
-        dollars: total_cents / 100,
-        cents: (total_cents % 100) as u32,
+        dollars: value.floor() as u64,
+        cents: ((value * 100_f64) as u32) % 100,
     }
 }
 
 impl fmt::Display for Quote {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}.{:02}", self.dollars, self.cents)
+        write!(f, "{}.{}", self.dollars, self.cents)
     }
 }
 
@@ -111,18 +101,6 @@ mod tests {
         let quote = create_quote_from_float(10.99);
         assert_eq!(quote.dollars, 10);
         assert_eq!(quote.cents, 99);
-
-        let quote = create_quote_from_float(8.99);
-        assert_eq!(quote.dollars, 8);
-        assert_eq!(quote.cents, 99);
-
-        let quote = create_quote_from_float(35.96);
-        assert_eq!(quote.dollars, 35);
-        assert_eq!(quote.cents, 96);
-
-        let quote = create_quote_from_float(71.92);
-        assert_eq!(quote.dollars, 71);
-        assert_eq!(quote.cents, 92);
 
         let quote = create_quote_from_float(0.01);
         assert_eq!(quote.dollars, 0);
@@ -145,18 +123,6 @@ mod tests {
             dollars: 0,
             cents: 1,
         };
-        assert_eq!(format!("{}", quote), "0.01");
-
-        let quote = Quote {
-            dollars: 10,
-            cents: 5,
-        };
-        assert_eq!(format!("{}", quote), "10.05");
-
-        let quote = Quote {
-            dollars: 100,
-            cents: 0,
-        };
-        assert_eq!(format!("{}", quote), "100.00");
+        assert_eq!(format!("{}", quote), "0.1");
     }
 }

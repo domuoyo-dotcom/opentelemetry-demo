@@ -5,7 +5,7 @@ import Document, { DocumentContext, Html, Head, Main, NextScript } from 'next/do
 import { ServerStyleSheet } from 'styled-components';
 import {context, propagation} from "@opentelemetry/api";
 
-const { ENV_PLATFORM, WEB_OTEL_SERVICE_NAME, PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_COLLECTOR_HOST} = process.env;
+const { ENV_PLATFORM, WEB_OTEL_SERVICE_NAME, PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_COLLECTOR_HOST } = process.env;
 
 export default class MyDocument extends Document<{ envString: string }> {
   static async getInitialProps(ctx: DocumentContext) {
@@ -32,6 +32,12 @@ export default class MyDocument extends Document<{ envString: string }> {
           NEXT_PUBLIC_OTEL_SERVICE_NAME: '${WEB_OTEL_SERVICE_NAME}',
           NEXT_PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: '${otlpTracesEndpoint}',
           IS_SYNTHETIC_REQUEST: '${isSyntheticRequest}',
+          SPLUNK_RUM_TOKEN: '${process.env.SPLUNK_RUM_TOKEN}',
+          SPLUNK_APP_NAME: '${process.env.SPLUNK_APP_NAME}',
+          SPLUNK_ENV: '${process.env.SPLUNK_RUM_ENV}',
+          SPLUNK_RUM_REALM: '${process.env.SPLUNK_RUM_REALM}',
+          SPLUNK_APP_VERSION: '${process.env.SPLUNK_APP_VERSION || 'latest'}',
+          DEPLOYMENT_TYPE: '${process.env.DEPLOYMENT_TYPE || 'green'}'
         };`;
       return {
         ...initialProps,
@@ -53,10 +59,115 @@ export default class MyDocument extends Document<{ envString: string }> {
             href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,300;1,400;1,500;1,600;1,700;1,800&display=swap"
             rel="stylesheet"
           />
+          {/* Inject window.ENV first */}
+          <script
+              crossOrigin="anonymous"
+              dangerouslySetInnerHTML={{ __html: this.props.envString }}>
+          </script>
+          {/* Load user attributes generator - must load before RUM initialization */}
+          <script src="/global-attributes.js"></script>
+          <script
+              src="https://cdn.signalfx.com/o11y-gdi-rum/v3.0.0/splunk-otel-web.js"
+              crossOrigin="anonymous"
+          />
+          <script
+              id="splunk-rum-init"
+              dangerouslySetInnerHTML={{
+                __html: `
+                  SplunkRum.init({
+                    realm: window.ENV.SPLUNK_RUM_REALM,
+                    rumAccessToken: window.ENV.SPLUNK_RUM_TOKEN,
+                    applicationName: window.ENV.SPLUNK_APP_NAME,
+                    deploymentEnvironment: window.ENV.SPLUNK_ENV,
+                    globalAttributes: getSplunkGlobalAttributes(),
+                    version: window.ENV.SPLUNK_APP_VERSION,
+                    // Digital Experience Analytics configuration
+                    user: {
+                      trackingMode: 'anonymousTracking'
+                    },
+                    privacy: {
+                      "maskAllText": false
+                    },
+                    instrumentations: {
+                      "frustrationSignals": {
+                        "rageClick": true
+                      }
+                    },
+                    _experimental_dataAttributesToCapture: [
+                      "data-cy",
+                    ],
+                    _experimental_spaMetrics: true
+                  });
+                  
+                  // Initialize tracer for custom spans and expose globally
+                  const tracer = SplunkRum.provider.getTracer('appModuleLoader');
+                  window.tracer = tracer; // Make tracer available globally for custom spans
+                `,
+              }}
+          />
+          <script
+              src="https://cdn.signalfx.com/o11y-gdi-rum/v3.0.0/splunk-otel-web-session-recorder.js"
+              crossOrigin="anonymous"
+          />
+          <script
+              id="splunk-session-recorder-init"
+              dangerouslySetInnerHTML={{
+                __html: `
+                    (function () {
+                        var loc = window.location;
+                        var isHttp = loc.protocol === 'http:';
+                        var isLocal = loc.hostname === 'localhost' || loc.hostname === '127.0.0.1';
+                        var isHttpWorkshop = isHttp && !isLocal;
+                        // HTTP workshop instances serve images over HTTP; the HTTPS
+                        // replay player blocks them as mixed content. Pack assets
+                        // into the recording so replay renders without live fetch.
+                        // Skip localhost — dev doesn't need the extra payload.
+                        var features = isHttpWorkshop
+                            ? {
+                                packAssets: {
+                                    styles: true,
+                                    fonts: false,
+                                    // Explicit object form: pack every image, not
+                                    // just the ones currently in the viewport, so
+                                    // above-the-fold hero images on the initial
+                                    // page load are also captured.
+                                    images: { pack: true, onlyViewportImages: false }
+                                },
+                                cacheAssets: true
+                              }
+                            : { packAssets: { styles: true } };
+                        var rumVersion = 'unknown';
+                        try {
+                            // Version lives on the tracer provider's resource attributes,
+                            // not as a top-level SplunkRum property.
+                            var attrs = window.SplunkRum && window.SplunkRum.provider &&
+                                        window.SplunkRum.provider.resource &&
+                                        window.SplunkRum.provider.resource.attributes;
+                            if (attrs) rumVersion = attrs['splunk.rumVersionFull'] || attrs['splunk.rumVersion'] || 'unknown';
+                        } catch (e) { /* noop */ }
+                        var recorderSrc = 'unknown';
+                        var recorderScript = document.querySelector('script[src*="splunk-otel-web-session-recorder"]');
+                        if (recorderScript) recorderSrc = recorderScript.getAttribute('src');
+                        console.log(
+                            '[splunk-rum] version:', rumVersion,
+                            '\\n[splunk-session-recorder] script:', recorderSrc,
+                            '\\n[splunk-session-recorder] protocol:', loc.protocol, 'hostname:', loc.hostname,
+                            '\\n[splunk-session-recorder] isHttpWorkshop:', isHttpWorkshop,
+                            '\\n[splunk-session-recorder] features:', JSON.stringify(features)
+                        );
+                        SplunkSessionRecorder.init({
+                            realm: window.ENV.SPLUNK_RUM_REALM,
+                            rumAccessToken: window.ENV.SPLUNK_RUM_TOKEN,
+                            maskAllText: false,
+                            features: features
+                        });
+                    })();
+                `,
+              }}
+          />
         </Head>
         <body>
           <Main />
-          <script dangerouslySetInnerHTML={{ __html: this.props.envString }}></script>
           <NextScript />
         </body>
       </Html>

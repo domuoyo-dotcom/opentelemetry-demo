@@ -4,7 +4,6 @@ const grpc = require('@grpc/grpc-js')
 const protoLoader = require('@grpc/proto-loader')
 const health = require('grpc-js-health-check')
 const opentelemetry = require('@opentelemetry/api')
-const { ATTR_ERROR_TYPE } = require('@opentelemetry/semantic-conventions')
 
 const charge = require('./charge')
 const logger = require('./logger')
@@ -15,19 +14,29 @@ async function chargeServiceHandler(call, callback) {
   try {
     const amount = call.request.amount
     span?.setAttributes({
-      'demo.payment.amount': (Number(amount.units) + amount.nanos / 1000000000).toFixed(2)
+      'app.payment.amount': parseFloat(`${amount.units}.${amount.nanos}`).toFixed(2)
     })
+    logger.info("Entering payment service.")
     logger.info("Charge request received.")
 
     const response = await charge.charge(call.request)
+    logger.info("Charge authorized, returning to caller.")
+    logger.info("Leaving payment service.")
     callback(null, response)
 
   } catch (err) {
     logger.warn({ err })
 
-    span?.setStatus({ code: opentelemetry.SpanStatusCode.ERROR, message: err.message })
-    span?.setAttribute(ATTR_ERROR_TYPE, err.name || 'Error')
+    span?.recordException(err)
+    span?.setStatus({ code: opentelemetry.SpanStatusCode.ERROR })
     callback(err)
+
+    // Emitted after the error so the failure is not the final log line in the
+    // trace; checkout adds its own unwind breadcrumbs on top of these.
+    logger.info("Charge not authorized, no funds captured.")
+    logger.info("Payment gateway session closed.")
+    logger.info("Charge request rejected, returning to caller.")
+    logger.info("Leaving payment service.")
   }
 }
 
@@ -62,7 +71,6 @@ server.bindAsync(address, grpc.ServerCredentials.createInsecure(), (err, port) =
     return logger.error({ err })
   }
 
-  server.start()
   logger.info(`payment gRPC server started on ${address}`)
 })
 

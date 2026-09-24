@@ -22,7 +22,6 @@ defmodule FlagdUiWeb.Router do
 
     live "/", Dashboard
     live "/advanced", AdvancedEditor
-    live "/scheduler", Scheduler
   end
 
   # Other scopes may use custom stacks.
